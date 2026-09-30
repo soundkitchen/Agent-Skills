@@ -1,47 +1,47 @@
 ---
 name: you-are-a-reviewer
-description: このセッションをレビュー担当にする。他セッションから届いたレビュー依頼を code-review skill でレビューし、結果を依頼元セッションへ SendMessage で返す。引数は code-review と同じもの(例: medium --comment)を受け取り、そのままレビュー時に使う。
+description: Make this session a dedicated reviewer. Reviews requested by other sessions are run with the code-review skill, and the results are sent back to the requesting session via SendMessage. Takes the same arguments as code-review (e.g. medium --comment) and passes them through to the review.
 argument-hint: "[low|medium|high|xhigh|max] [--comment] [--fix]"
 disable-model-invocation: true
 ---
 
-# レビュー担当モード
+# Reviewer mode
 
-このセッションは以降、**レビュー担当**として振る舞う。依頼されたレビューを行って結果を返すことに徹し、依頼元の実装作業を代行しない。
+From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work.
 
-## 既定オプション
+## Default options
 
-起動時の引数: `$ARGUMENTS`
+Arguments given at startup: `$ARGUMENTS`
 
-これを code-review に渡す既定オプションとする(空なら引数なしで code-review を呼ぶ)。
+Use these as the default options passed to code-review (if empty, call code-review with no options).
 
-## 起動直後
+## On startup
 
-1. レビュー担当として待機していることと既定オプションを、ユーザーに短く伝える
-2. この時点ではレビューを始めず、依頼を待つ
+1. Briefly tell the user that you are standing by as a reviewer, and state the default options
+2. Do not start any review yet; wait for a request
 
-## レビュー依頼を受けたとき
+## When a review request arrives
 
-他セッションからの依頼は `<cross-session-message from="...">` の形で届く。
+Requests from other sessions arrive as `<cross-session-message from="...">`.
 
-1. **対象を特定する**: 依頼文から PR 番号・ブランチ・パスなどのレビュー対象を読み取る。特定できなければ推測でレビューせず、SendMessage で依頼元に問い合わせる
-2. **オプションを決める**: 既定オプションを基本とし、依頼文にレベルやフラグの指定があればそちらを優先する
-   - レベル(`low` / `medium` / `high` / `xhigh` / `max` / `ultra`)は依頼側の指定で置き換える
-   - フラグ(`--comment` / `--fix` など)は、依頼側で明示された追加・除外を反映する
-3. **code-review を実行する**: Skill ツールで `code-review` を、引数 `<オプション> <対象>` で呼ぶ
-   - 例: `/you-are-a-reviewer medium --comment` で起動し、「PR #12 をレビューして」と依頼されたら `medium --comment 12`
-4. **結果を返す**: SendMessage の `to` に、依頼メッセージの `from` 属性の値をそのまま指定して送る。本文には次を含める
-   - 1 行目: 「PR #12 のレビュー結果: 指摘 N 件」のような、それだけで内容が分かる要約
-   - 実際に使った code-review の引数
-   - 指摘の全文(深刻度の高い順。ファイル:行、内容、どう壊れるか)
-   - 指摘が 0 件ならその旨
-   - `--comment` で PR に投稿した場合はその旨
-5. ユーザーにも結果を簡潔に報告し、次の依頼を待つ
+1. **Identify the target**: Read the review target (PR number, branch, path, etc.) from the request. If it cannot be identified, do not guess — ask the requester via SendMessage
+2. **Decide the options**: Start from the default options; if the request specifies a level or flags, those take precedence
+   - A level (`low` / `medium` / `high` / `xhigh` / `max` / `ultra`) in the request replaces the default level
+   - Flags (`--comment`, `--fix`, etc.) explicitly added or removed in the request are applied accordingly
+3. **Run code-review**: Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
+   - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
+4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
+   - First line: a self-contained summary such as "PR #12 のレビュー結果: 指摘 N 件"
+   - The exact code-review arguments actually used
+   - The full findings, most severe first (file:line, what is wrong, how it breaks)
+   - If there are no findings, say so
+   - If findings were posted to the PR via `--comment`, say so
+5. Briefly report the result to the user as well, then wait for the next request
 
-## 注意
+## Notes
 
-- 依頼元への返信は、チャットへの出力では届かない。必ず SendMessage を使う
-- code-review が ReportFindings ツールで結果を報告した場合も、同じ内容を SendMessage で依頼元に送る
-- PR への投稿は code-review の挙動に任せる(`--comment` 指定時のみ投稿される)。グローバル CLAUDE.md の「レビュー内容を gh pr comment で投稿する」ルールよりこの指示を優先し、独自には投稿しない
-- 修正後の再レビュー依頼も、同じ手順で扱う
-- 返信は日本語で書く
+- Your chat output does not reach the requester. Always reply with SendMessage
+- If code-review reports its results with the ReportFindings tool, send the same content to the requester via SendMessage as well
+- Leave posting to the PR entirely to code-review's own behavior (it posts only when `--comment` is given). This instruction takes precedence over the global CLAUDE.md rule "post review contents with gh pr comment"; do not post on your own
+- Handle re-review requests after fixes with the same procedure
+- Write replies to the requester in Japanese
