@@ -49,7 +49,7 @@ Send the request with SendMessage to the reviewer. Write it in Japanese. The fir
 - The local repository path (the reviewer may work in the same repository)
 - A summary of what the PR changes
 - The level and flags, if any were given (e.g. "レベルは high、フラグは --comment でお願いします"). Otherwise say that no level or flags are specified
-- For a re-review (see below): the open points from the previous review, the commit the reviewer last reviewed, and what was changed for each point
+- For a re-review (see below): the open points from the previous review, the commit the reviewer last reviewed, and what was changed for each point. For a point that was decided not to be fixed (e.g. by the user's decision), say so with the reason, so that the reviewer can close it instead of reporting it as unresolved again
 - "指摘がなければ LGTM と返してください"
 
 Then tell the user that the request was sent and you are waiting for the result. Do not poll; the reviewer's reply arrives as a `<cross-session-message>`. To reply to the reviewer within the same review, use the `from` attribute of its latest message as `to`.
@@ -69,11 +69,21 @@ Repeat until the reviewer says LGTM:
    - A fix would change behavior or a policy that the user decided earlier, or deviate from the project's docs/spec
    - You disagree with a finding, or it cannot be fixed as suggested (explain why, and propose an alternative)
    - The rally is not converging (e.g. new findings keep appearing in different areas round after round). Ask whether to continue, change the approach, or stop
-3. Fix the findings. You may commit and push to the PR's branch without asking. Keep the PR description up to date if the fixes affect it. If the reviewer posted inline comments on the PR, reply to each one saying how it was addressed
-4. Send a re-review request as in step 3, including the open points, the commit the reviewer last reviewed, and what was changed for each point
+3. Fix the findings, except those decided not to be fixed. You may commit and push to the PR's branch without asking. Keep the PR description up to date if the fixes affect it. If the reviewer posted inline comments on the PR, reply to each one saying how it was addressed
+4. Send a re-review request as in step 3, including the open points, the commit the reviewer last reviewed, and what was changed for each point (or, for points not fixed, that decision and its reason)
 5. Tell the user briefly what was fixed and that you are waiting for the re-review
 
 When the reviewer says LGTM, report it to the user with a summary of the rally. Never merge the PR; merging is the user's decision.
+
+## After merging
+
+If the user later asks you to merge a PR that was reviewed through this skill in this session, then after merging it, tell the reviewer you last exchanged messages with about that PR, via SendMessage (in Japanese):
+
+- That the PR was merged, with the merge commit
+- Whether the merged head is the commit the reviewer gave LGTM to. If commits were added after the LGTM, say so and list them
+- That there are no further requests for this PR
+
+This applies only when this session does the merge. If the PR is merged elsewhere (e.g. on GitHub or from another session), you cannot notice it, so do not send anything.
 
 ## Notes
 
