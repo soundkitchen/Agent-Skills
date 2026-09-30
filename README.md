@@ -23,6 +23,7 @@ Claude Code 用の自作 skill 集。
 ```sh
 git clone https://github.com/soundkitchen/Agent-Skills.git
 cd Agent-Skills
+mkdir -p ~/.claude/skills
 ln -s "$PWD/<skill-name>" ~/.claude/skills/<skill-name>
 ```
 
