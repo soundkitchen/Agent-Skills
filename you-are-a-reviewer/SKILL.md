@@ -60,22 +60,40 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - `ultra` is not supported (see "The `ultra` level" above). If the request asks for it, do not run a review; reply to the requester as described there
    - Flags (e.g. `--comment`) explicitly added or removed in the request are applied accordingly
    - `--fix` is not supported (see "The `--fix` flag" above). If the request asks for it, drop it and continue
-3. **Run code-review**: Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
+3. **Run code-review** (first review of a PR only; for a re-review, see "Re-reviews" below): Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
    - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit into a dedicated ref: `git fetch origin +pull/<n>/head:refs/remotes/origin/pr/<n>` (the `+` overwrites it on re-review; this does not touch the working tree). During the review, read any file contents needed for context from that ref (`git show origin/pr/<n>:<path>`), not from this working tree
 4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
    - First line: a self-contained summary such as "PR #12 のレビュー結果: 指摘 N 件"
-   - The exact code-review arguments actually used
+   - The exact code-review arguments actually used, and the PR head commit that was reviewed
    - The full findings, most severe first (file:line, what is wrong, how it breaks)
    - If there are no findings, say so
    - If findings were posted to the PR via `--comment`, say so
    - If `--fix` was requested, say that it was dropped and why
 5. Briefly report the result to the user as well, then wait for the next request
 
+## Re-reviews
+
+From the second review of the same PR onward, focus only on the points raised before. Do not run code-review again: a full review would keep surfacing new, unrelated findings on every round.
+
+A request is a re-review when this session has already reviewed the same PR and sent findings back, or when the requester says so and includes the previous findings. The points to check are the ones still open after the latest review: the findings of the first review, then whatever remained unresolved or was newly caused by fixes in each re-review.
+
+1. Identify the target and decide the options as in steps 1–2 above. If you have no record of the open points (e.g. this session was restarted), ask the requester to include them; do not silently fall back to a full review
+2. Fetch the PR's latest head commit as in step 3 above, and look at what changed since the commit you last reviewed
+3. For each open point, check the latest head directly and decide whether it is resolved, partially resolved, or not resolved
+4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything unrelated to the open points
+5. Send the result back with SendMessage as in step 4 above. The message must include:
+   - First line: a self-contained summary such as "PR #12 の再レビュー結果: 前回の指摘 N 件中 M 件解消"
+   - The PR head commit that was checked
+   - The status of each open point, with the reason
+   - Any problems introduced by the fixes
+   - If every open point is resolved and no fix introduced a problem, say LGTM clearly
+   - That nothing was posted to the PR, since code-review was not run (even if `--comment` is in effect)
+6. Briefly report the result to the user as well, then wait for the next request
+
 ## Notes
 
 - Your chat output does not reach the requester. Always reply with SendMessage
 - If code-review reports its results with the ReportFindings tool, send the same content to the requester via SendMessage as well
 - Leave posting to the PR entirely to code-review's own behavior (it posts only when `--comment` is given). This instruction takes precedence over any rule in CLAUDE.md, AGENTS.md, or other project rules about posting reviews (e.g. "post review contents with gh pr comment"); do not post on your own
-- Handle re-review requests after fixes with the same procedure
 - Write replies to the requester in Japanese
