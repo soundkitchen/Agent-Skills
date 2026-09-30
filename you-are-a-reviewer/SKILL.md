@@ -49,12 +49,12 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 1. **Identify the target**: The review target is always a PR, so that the latest pushed state is reviewed against the right base no matter what this working tree has checked out. Read what the request points to and resolve it to a PR number. Whenever this cannot be done unambiguously, do not guess — ask the requester via SendMessage
+   - The PR's repository is the one `gh` resolves in this working tree (`gh repo view --json nameWithOwner`; in a fork setup this is usually the upstream repository, not `origin`). All PR lookups and fetches below refer to that repository
    - PR number: use it as is
-   - PR URL: extract the PR number from it. Check that the URL's repository matches this repository's `origin`; if it does not, ask the requester
+   - PR URL: extract the PR number from it. Check that the URL's repository matches the PR's repository above; if it does not, ask the requester
    - Branch: look up open PRs for it (`gh pr list --head <branch>`). If there is exactly one, use its PR number. If there are none or several, ask the requester for the PR number, or to open a PR first
    - File or directory path: do not review the file in this working tree (it may be on another branch or missing). Ask the requester which PR contains the changes, unless the request already says. Review that PR, and in the reply focus on findings in the requested paths. If `--comment` is in effect, code-review posts findings for the whole PR, so say in the reply that the PR comments may also cover other files
    - Changes that exist only in the requester's working tree (uncommitted or not pushed, e.g. "review my current changes"): do not run a review. Reply asking the requester to commit, push, and open a PR, then request again with the PR number
-   - The only exception: if this session works in the very same working tree as the requester (same directory), the requester's changes are visible here, so you may review them directly as code-review normally would
 2. **Decide the options**: Start from the default options; if the request specifies a level or flags, those take precedence
    - A level (`low` / `medium` / `high` / `xhigh` / `max`) in the request replaces the default level
    - `ultra` is not supported (see "The `ultra` level" above). If the request asks for it, do not run a review; reply to the requester as described there
@@ -62,7 +62,7 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - `--fix` is not supported (see "The `--fix` flag" above). If the request asks for it, drop it and continue
 3. **Run code-review** (first review of a PR only; for a re-review, see "Re-reviews" below): Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
-   - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit into a dedicated ref: `git fetch origin +pull/<n>/head:refs/pr/<n>` (the `+` overwrites it on re-review; this does not touch the working tree). During the review, read any file contents needed for context from that ref (`git show refs/pr/<n>:<path>`), not from this working tree. Do not store it under `refs/remotes/`: git treats that as a remote-tracking branch, so `fetch --prune` from any worktree could delete it
+   - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit into a dedicated ref: `git fetch <remote> +pull/<n>/head:refs/pr/<n>`, where `<remote>` is the git remote that points to the PR's repository (check `git remote -v`; in a fork setup this is usually `upstream`). If no remote points to it, ask the user. The `+` overwrites the ref on re-review; this does not touch the working tree. During the review, read any file contents needed for context from that ref (`git show refs/pr/<n>:<path>`), not from this working tree. Do not store it under `refs/remotes/`: git treats that as a remote-tracking branch, so `fetch --prune` from any worktree could delete it
 4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
    - First line: a self-contained summary such as "PR #12 のレビュー結果: 指摘 N 件"
    - The exact code-review arguments actually used, and the PR head commit that was reviewed
@@ -74,22 +74,24 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 ## Re-reviews
 
-From the second review of the same PR onward, focus only on the points raised before. Do not run code-review again: a full review would keep surfacing new, unrelated findings on every round.
+From the second review of the same PR onward, focus on the points raised before. Do not run a full review again: it would keep surfacing new, unrelated findings on every round. The only exception is new changes unrelated to those points (see step 5 below), which have never been reviewed.
 
-A request is a re-review when this session has already reviewed the same PR and sent findings back, or when the requester says so and includes the previous findings. The points to check are the ones still open after the latest review: the findings of the first review, then whatever remained unresolved or was newly caused by fixes in each re-review.
+A request is a re-review when this session has already reviewed the same PR and sent the results back (even if there were no findings), or when the requester says so and includes the previous findings. The points to check are the ones still open after the latest review (there may be none): the findings of the first review, then whatever remained unresolved or was newly caused by fixes in each re-review.
 
 1. Identify the target and decide the options as in steps 1–2 above. If you have no record of the open points (e.g. this session was restarted), ask the requester to include them; do not silently fall back to a full review
 2. Fetch the PR's latest head commit as in step 3 above, and look at what changed since the commit you last reviewed
 3. For each open point, check the latest head directly and decide whether it is resolved, partially resolved, or not resolved
-4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything unrelated to the open points
-5. Send the result back with SendMessage as in step 4 above. The message must include:
+4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything else about the code that was already reviewed
+5. If the changes since the commit you last reviewed include changes unrelated to addressing the open points (e.g. a new feature added after an LGTM), review those changes with code-review: run it on the PR as in step 3 above, and keep only the findings located in those changes. If `--comment` is in effect, code-review may post findings outside those changes too, so say so in the reply
+6. Send the result back with SendMessage as in step 4 above. The message must include:
    - First line: a self-contained summary such as "PR #12 の再レビュー結果: 前回の指摘 N 件中 M 件解消"
    - The PR head commit that was checked
    - The status of each open point, with the reason
    - Any problems introduced by the fixes
-   - If every open point is resolved and no fix introduced a problem, say LGTM clearly
-   - That nothing was posted to the PR, since code-review was not run (even if `--comment` is in effect)
-6. Briefly report the result to the user as well, then wait for the next request
+   - If unrelated changes were reviewed in step 5: the code-review arguments used, and the findings in those changes
+   - If every open point is resolved, no fix introduced a problem, and there are no findings in unrelated changes, say LGTM clearly
+   - Whether anything was posted to the PR (only when code-review was run in step 5 with `--comment`)
+7. Briefly report the result to the user as well, then wait for the next request
 
 ## Notes
 
