@@ -1,7 +1,7 @@
 ---
 name: request-review
 description: Ask a reviewer session (another Claude session running the you-are-a-reviewer skill) to review the current branch's PR, via SendMessage. Use when the user asks to request a review from a reviewer or another session, e.g. "レビューを頼んで", "レビューをお願いして", "skill-reviewer にレビュー依頼して", "LGTM が出るまでレビューしてもらって". Not for reviewing code yourself (use code-review for that). Optionally takes the reviewer's session name, a code-review level for this review, and --lgtm to keep fixing and re-requesting until the reviewer says LGTM.
-argument-hint: "[reviewer-name] [low|medium|high|xhigh|max] [--lgtm]"
+argument-hint: "[reviewer-name] [low|medium|high|xhigh|max] [--lgtm] [--comment ...]"
 ---
 
 # Request a review
@@ -19,6 +19,7 @@ Parse them as follows (in any order):
 - `low` / `medium` / `high` / `xhigh` / `max`: the code-review level for this review. If omitted, do not specify a level; the reviewer uses its own default
 - `ultra`: not supported by the reviewer. Tell the user and ask for another level (or none)
 - `--lgtm`: keep the rally going until the reviewer says LGTM (see "Rally until LGTM")
+- Any other word starting with `--` (e.g. `--comment`): a flag for the reviewer's code-review. Pass it through in the request as is; the reviewer applies flags given in the request (and drops the ones it does not support, such as `--fix`)
 - Any other word: the reviewer's session name
 
 ## Project rules
@@ -30,14 +31,14 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 - **Name given**: look it up with ListAgents
 - **Name omitted**: use the reviewer you last sent a review request to in this session. If there is none, ask the user
 - If exactly one live session has that name, use it. If none does, or several do, do not guess: show the user the candidates from ListAgents and ask which one to use
-- If the reviewer turned out to be a different session than last time (e.g. the reviewer was restarted under the same name), it has no record of earlier reviews. Treat the next request as a first review, and tell the user
+- If the reviewer turned out to be a different session than last time (e.g. the reviewer was restarted under the same name), it has no record of earlier reviews. If you have the open points and the last reviewed commit from this PR's previous review, include them in the request so that the reviewer can treat it as a re-review; otherwise request a first review. Tell the user either way
 
 ## 2. Find the PR
 
 The reviewer only reviews PRs, and only what has been pushed.
 
 1. Get the current branch's PR (`gh pr view --json number,url,headRefName,headRefOid`)
-2. Check that everything is pushed: there are no uncommitted changes (`git status --porcelain`), and the local `HEAD` matches the PR's head commit
+2. Check that everything is pushed: there are no uncommitted changes to tracked files (`git status --porcelain --untracked-files=no`), and the local `HEAD` matches the PR's head commit. Untracked files do not block the request, but if there are any, mention them to the user (they may be new files that were forgotten)
 3. If there is no PR, or there are uncommitted or unpushed changes, do not send the request yet. Tell the user what is missing and ask whether to commit, push, or open a PR. Do not do any of these without the user's approval
 
 ## 3. Send the request
@@ -47,7 +48,7 @@ Send the request with SendMessage to the reviewer. Write it in Japanese. The fir
 - The PR URL and number, and the PR head commit to review
 - The local repository path (the reviewer may work in the same repository)
 - A summary of what the PR changes
-- The level, if one was given (e.g. "レベルは high でお願いします"). Otherwise say that no level or flags are specified
+- The level and flags, if any were given (e.g. "レベルは high、フラグは --comment でお願いします"). Otherwise say that no level or flags are specified
 - For a re-review (see below): the open points from the previous review, the commit the reviewer last reviewed, and what was changed for each point
 - "指摘がなければ LGTM と返してください"
 
@@ -55,7 +56,7 @@ Then tell the user that the request was sent and you are waiting for the result.
 
 ## 4. Handle the result
 
-- **Without `--lgtm`**: summarize the result for the user (the findings, or LGTM) and wait for the user's instructions. Do not fix anything on your own
+- **Without `--lgtm`**: summarize the result for the user (the findings, or LGTM) and wait for the user's instructions. Do not fix anything on your own. If the user then asks to continue until LGTM (e.g. "LGTM まで続けて"), switch to "Rally until LGTM" from that point
 - **With `--lgtm`**: follow "Rally until LGTM"
 
 ## Rally until LGTM
