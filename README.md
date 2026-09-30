@@ -1,33 +1,48 @@
 # Agent-Skills
 
-Claude Code 用の自作 skill を管理するリポジトリ。
-
-## 構成
-
-skill ごとにディレクトリを切り、その中に `SKILL.md` を置く。
-
-```
-Agent-Skills/
-  <skill-name>/
-    SKILL.md
-```
-
-`SKILL.md` は Claude が読む指示書なので英語で書く(トークン効率のため)。README やコミットメッセージなど人が読むものは日本語で書く。
-
-## インストール(グローバル設定)
-
-`~/.claude/skills/` にシンボリックリンクを張ると、全プロジェクトで使えるようになる。
-
-```sh
-ln -s "$PWD/<skill-name>" ~/.claude/skills/<skill-name>
-```
+Claude Code 用の自作 skill 集。
 
 ## skill 一覧
 
-| skill | 概要 | 使い方 |
-|---|---|---|
-| [you-are-a-reviewer](you-are-a-reviewer/SKILL.md) | セッションをレビュー担当にする。他セッションからの依頼を code-review でレビューし、結果を依頼元に返す。2 回目以降は前回の指摘に絞って確認する | `/you-are-a-reviewer medium --comment`(引数は code-review と同じ。ただし `ultra` と `--fix` は非対応) |
-| [request-review](request-review/SKILL.md) | you-are-a-reviewer のセッションに、今のブランチの PR のレビューを依頼する。`--lgtm` なら LGTM が出るまで修正と再依頼を繰り返す。このセッションでマージしたら、レビュアーにマージしたことを伝える | `/request-review [レビュアー名] [レベル] [--lgtm] [--comment など]`(その他のフラグは reviewer にそのまま渡す。レビュアー名を省くと、このセッションで前回依頼した相手)。「レビューを頼んで」のような依頼でも起動する |
+| skill | 概要 |
+|---|---|
+| [you-are-a-reviewer](you-are-a-reviewer/README.md) | セッションをレビュー担当にする。他のセッションから届いたレビュー依頼を code-review でレビューし、結果を返す。[request-review](request-review/README.md) と組で使う |
+| [request-review](request-review/README.md) | you-are-a-reviewer のセッションに、今のブランチの PR のレビューを依頼する。LGTM が出るまで修正と再依頼を繰り返すこともできる |
+
+使い方や前提は、各 skill の README を参照。
+
+## 前提
+
+- [Claude Code](https://code.claude.com/docs/en/overview)
+- skill ごとの前提(外部ツールなど)は、各 skill の README に書いてある
+
+## インストール
+
+リポジトリを clone し、使いたい skill のディレクトリを `~/.claude/skills/` にシンボリックリンクする。全プロジェクトで使えるようになる。
+
+```sh
+git clone https://github.com/soundkitchen/Agent-Skills.git
+cd Agent-Skills
+ln -s "$PWD/<skill-name>" ~/.claude/skills/<skill-name>
+```
+
+- シンボリックリンクにしておくと、`git pull` で skill が更新される
+- 特定のプロジェクトだけで使う場合は、そのプロジェクトの `.claude/skills/` にリンクまたはコピーする
+- skill の内容は、呼び出したときにそのセッションへ読み込まれる。更新した skill を使うときは、セッションを起動し直す
+
+## リポジトリの構成
+
+```
+Agent-Skills/
+  README.md          ← このファイル(skill 一覧・共通の前提・インストール)
+  <skill-name>/
+    SKILL.md         ← Claude が読む指示書
+    README.md        ← 人向けの説明(使い方・引数・前提)
+```
+
+- `SKILL.md` は Claude が読む指示書なので英語で書く(トークン効率のため)。README やコミットメッセージなど人が読むものは日本語で書く
+- 挙動の詳細は `SKILL.md` が正とする。README は使い方の説明にとどめ、細かい仕様は `SKILL.md` へのリンクで済ませる
+- skill を追加・変更したら、その skill の README と、このファイルの skill 一覧も同じ PR で更新する
 
 ## ライセンス
 
