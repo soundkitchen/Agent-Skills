@@ -49,7 +49,8 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 1. **Identify the target**: The review target is always a PR, so that the latest pushed state is reviewed against the right base no matter what this working tree has checked out. Read what the request points to and resolve it to a PR number. Whenever this cannot be done unambiguously, do not guess — ask the requester via SendMessage
-   - PR number or URL: use it as is
+   - PR number: use it as is
+   - PR URL: extract the PR number from it. Check that the URL's repository matches this repository's `origin`; if it does not, ask the requester
    - Branch: look up open PRs for it (`gh pr list --head <branch>`). If there is exactly one, use its PR number. If there are none or several, ask the requester for the PR number, or to open a PR first
    - File or directory path: do not review the file in this working tree (it may be on another branch or missing). Ask the requester which PR contains the changes, unless the request already says. Review that PR, and in the reply focus on findings in the requested paths
    - Changes that exist only in the requester's working tree (uncommitted or not pushed, e.g. "review my current changes"): do not run a review. Reply asking the requester to commit, push, and open a PR, then request again with the PR number
@@ -61,7 +62,7 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - `--fix` is not supported (see "The `--fix` flag" above). If the request asks for it, drop it and continue
 3. **Run code-review**: Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
-   - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit (`git fetch origin pull/<n>/head`; it does not touch the working tree). During the review, read any file contents needed for context from that commit (`git show <sha>:<path>`), not from this working tree
+   - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit into a dedicated ref: `git fetch origin +pull/<n>/head:refs/remotes/origin/pr/<n>` (the `+` overwrites it on re-review; this does not touch the working tree). During the review, read any file contents needed for context from that ref (`git show origin/pr/<n>:<path>`), not from this working tree
 4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
    - First line: a self-contained summary such as "PR #12 のレビュー結果: 指摘 N 件"
    - The exact code-review arguments actually used
