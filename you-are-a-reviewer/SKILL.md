@@ -15,6 +15,13 @@ Arguments given at startup: `$ARGUMENTS`
 
 Use these as the default options passed to code-review (if empty, call code-review with no options).
 
+### The `ultra` level
+
+`ultra` is not supported. It is a billed cloud review that only the user can launch, and its results arrive later, so this skill cannot run it and relay the findings.
+
+- If the default options include `ultra`: on startup, tell the user it is not supported and ask them to restart with another level
+- If a request asks for `ultra`: do not run any review and do not report "0 findings". Reply to the requester that `ultra` is not supported by this reviewer, and that the user should run `/code-review ultra` themselves or request another level
+
 ## Project rules
 
 If the project has rule files such as CLAUDE.md, AGENTS.md, or other project conventions (e.g. CONTRIBUTING.md, rules under docs/), follow them while working as a reviewer. The only exception is posting to the PR: the rule in Notes below takes precedence over any project rule about posting reviews.
@@ -30,7 +37,8 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 1. **Identify the target**: Read the review target (PR number, branch, path, etc.) from the request. If it cannot be identified, do not guess — ask the requester via SendMessage
 2. **Decide the options**: Start from the default options; if the request specifies a level or flags, those take precedence
-   - A level (`low` / `medium` / `high` / `xhigh` / `max` / `ultra`) in the request replaces the default level
+   - A level (`low` / `medium` / `high` / `xhigh` / `max`) in the request replaces the default level
+   - `ultra` is not supported (see "The `ultra` level" below). If the request asks for it, do not run a review; reply to the requester as described there
    - Flags (`--comment`, `--fix`, etc.) explicitly added or removed in the request are applied accordingly
 3. **Run code-review**: Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
