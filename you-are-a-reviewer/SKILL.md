@@ -81,6 +81,7 @@ A request is a re-review when this session has already reviewed the same PR and 
 1. Identify the target and decide the options as in steps 1–2 above. If you have no record of the open points or of the commit you last reviewed (e.g. this session was restarted), ask the requester to include both, even if the previous review had no findings; do not silently fall back to a full review
 2. Fetch the PR's latest head commit as in step 3 above, and look at what changed since the commit you last reviewed
 3. For each open point, check the latest head directly and decide whether it is resolved, partially resolved, or not resolved
+   - If the requester says a point was decided not to be fixed and gives a reason (e.g. the user's decision), judge the reason. If you accept it, close the point as "not fixed (agreed)"; it does not block LGTM. If you do not accept it, keep it open and explain why
 4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything else about the code that was already reviewed
 5. If the changes since the commit you last reviewed include changes unrelated to addressing the open points (e.g. a new feature added after an LGTM), review those changes with code-review: run it on the PR as in step 3 above, and keep only the findings located in those changes. If `--comment` is in effect, code-review may post findings outside those changes too, so say so in the reply
 6. Send the result back with SendMessage as in step 4 above. The message must include:
@@ -89,9 +90,19 @@ A request is a re-review when this session has already reviewed the same PR and 
    - The status of each open point, with the reason
    - Any problems introduced by the fixes
    - If unrelated changes were reviewed in step 5: the code-review arguments used, and the findings in those changes
-   - If every open point is resolved, no fix introduced a problem, and there are no findings in unrelated changes, say LGTM clearly
+   - If every open point is resolved or closed as "not fixed (agreed)", no fix introduced a problem, and there are no findings in unrelated changes, say LGTM clearly
    - Whether anything was posted to the PR (only when code-review was run in step 5 with `--comment`)
 7. Briefly report the result to the user as well, then wait for the next request
+
+## Messages that are not review requests
+
+Not every message from a requester is a review request. For example, a requester may notify you that a PR you reviewed has been merged. For such a notice:
+
+- Do not run any review, and do not treat commits listed in it as changes to review
+- Consider the review of that PR finished: later requests for the same PR are handled as a first review
+- Briefly tell the user. No reply to the requester is needed
+
+If you are not sure whether a message asks for a review, ask the requester instead of reviewing.
 
 ## Notes
 

@@ -37,9 +37,9 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 
 The reviewer only reviews PRs, and only what has been pushed.
 
-1. Get the current branch's PR (`gh pr view --json number,url,headRefName,headRefOid`)
+1. Get the current branch's PR (`gh pr view --json number,url,state,headRefName,headRefOid`). `gh pr view` also returns closed or merged PRs, so check that its state is `OPEN`
 2. Check that everything is pushed: there are no uncommitted changes to tracked files (`git status --porcelain --untracked-files=no`), and the local `HEAD` matches the PR's head commit. Untracked files do not block the request, but if there are any, mention them to the user (they may be new files that were forgotten)
-3. If there is no PR, or there are uncommitted or unpushed changes, do not send the request yet. Tell the user what is missing and ask whether to commit, push, or open a PR. Do not do any of these without the user's approval
+3. If there is no open PR, or there are uncommitted or unpushed changes, do not send the request yet. Tell the user what is missing and ask whether to commit, push, or open a PR. Do not do any of these without the user's approval
 
 ## 3. Send the request
 
@@ -58,6 +58,8 @@ Then tell the user that the request was sent and you are waiting for the result.
 
 - **Without `--lgtm`**: summarize the result for the user (the findings, or LGTM) and wait for the user's instructions. Do not fix anything on your own. If the user then asks to continue until LGTM (e.g. "LGTM まで続けて"), switch to "Rally until LGTM" from that point
 - **With `--lgtm`**: follow "Rally until LGTM"
+
+The reviewer's reply is not always findings or LGTM. It may be a question or an error (e.g. it cannot identify the PR, the level is not supported, or it asks for the previous findings and the commit last reviewed). Treat such a reply as neither findings nor LGTM: answer it if you can (e.g. with the PR number, or the open points and the commit last reviewed) and send the request again; otherwise tell the user and wait. Consider the review passed only when the reviewer explicitly says LGTM.
 
 ## Rally until LGTM
 
@@ -81,7 +83,7 @@ If the user later asks you to merge a PR that was reviewed through this skill in
 
 - That the PR was merged, with the merge commit
 - Whether the merged head is the commit the reviewer gave LGTM to. If commits were added after the LGTM, say so and list them
-- That there are no further requests for this PR
+- That there are no further requests for this PR, and that this message is only a notice and needs no review (write it in the first line, e.g. "PR #12 をマージしました(通知のみで、レビューは不要です)")
 
 This applies only when this session does the merge. If the PR is merged elsewhere (e.g. on GitHub or from another session), you cannot notice it, so do not send anything.
 
