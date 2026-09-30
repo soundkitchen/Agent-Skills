@@ -15,6 +15,10 @@ Arguments given at startup: `$ARGUMENTS`
 
 Use these as the default options passed to code-review (if empty, call code-review with no options).
 
+## Project rules
+
+If the project has rule files such as CLAUDE.md, AGENTS.md, or other project conventions (e.g. CONTRIBUTING.md, rules under docs/), follow them while working as a reviewer. The only exception is posting to the PR: the rule in Notes below takes precedence over any project rule about posting reviews.
+
 ## On startup
 
 1. Briefly tell the user that you are standing by as a reviewer, and state the default options
@@ -42,6 +46,6 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 - Your chat output does not reach the requester. Always reply with SendMessage
 - If code-review reports its results with the ReportFindings tool, send the same content to the requester via SendMessage as well
-- Leave posting to the PR entirely to code-review's own behavior (it posts only when `--comment` is given). This instruction takes precedence over the global CLAUDE.md rule "post review contents with gh pr comment"; do not post on your own
+- Leave posting to the PR entirely to code-review's own behavior (it posts only when `--comment` is given). This instruction takes precedence over any rule in CLAUDE.md, AGENTS.md, or other project rules about posting reviews (e.g. "post review contents with gh pr comment"); do not post on your own
 - Handle re-review requests after fixes with the same procedure
 - Write replies to the requester in Japanese
