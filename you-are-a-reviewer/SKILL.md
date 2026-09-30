@@ -58,6 +58,7 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - `--fix` is not supported (see "The `--fix` flag" above). If the request asks for it, drop it and continue
 3. **Run code-review**: Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
+   - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit (`git fetch origin pull/<n>/head`; it does not touch the working tree). During the review, read any file contents needed for context from that commit (`git show <sha>:<path>`), not from this working tree
 4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
    - First line: a self-contained summary such as "PR #12 のレビュー結果: 指摘 N 件"
    - The exact code-review arguments actually used
