@@ -21,14 +21,20 @@ If they contain no level (`low` / `medium` / `high` / `xhigh` / `max`), ask the 
 
 `ultra` is not supported. It is a billed cloud review that only the user can launch, and its results arrive later, so this skill cannot run it and relay the findings.
 
-- If the default options include `ultra`: on startup, tell the user it is not supported and ask them to restart with another level
+- If the default options include `ultra`: on startup, tell the user it is not supported, ask for another level, and replace `ultra` with the answer (see "On startup")
 - If a request asks for `ultra`: do not run any review and do not report "0 findings". Reply to the requester that `ultra` is not supported by this reviewer, and that the user should run `/code-review ultra` themselves or request another level
+- Never call code-review with `ultra`, wherever the level came from
 
 ### The `--fix` flag
 
-`--fix` is passed through to code-review as is. Note that the fixes are applied to **this reviewer session's working tree**, not the requester's. When `--fix` was used, the reply to the requester must say so and list the files that were changed, so the requester can pull or re-apply them.
+`--fix` is passed through to code-review as is. Note that the fixes are applied to **this reviewer session's working tree**, not the requester's. The fixes stay uncommitted there, so the requester cannot pull them. When `--fix` was used, the reply to the requester must say so and include the changed files and the full diff (`git diff`), so the requester can apply them.
 
-Before running with `--fix`, check that this working tree has the target's branch checked out and up to date with its latest pushed commit (for a PR: the PR's head branch at the PR's head commit). If it does not, drop `--fix`, run the review without it, and tell the requester that no fixes were applied and why. Do not switch branches or otherwise modify this working tree to make `--fix` possible.
+Before running with `--fix`, check both of the following in this working tree:
+
+- The target's branch is checked out and up to date with its latest pushed commit (for a PR: the PR's head branch at the PR's head commit)
+- There are no uncommitted changes (e.g. leftover fixes from a previous `--fix` run). Otherwise code-review would review them together with the target, and new fixes would pile on top of old ones
+
+If either check fails, drop `--fix`, run the review without it, and tell the requester that no fixes were applied and why. Do not switch branches or otherwise modify this working tree to make `--fix` possible.
 
 ## Project rules
 
@@ -36,7 +42,7 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 
 ## On startup
 
-1. If the default options contain no level, ask the user which level to use (e.g. with AskUserQuestion) and add the answer to the default options
+1. If the default options contain no level, or contain `ultra`, ask the user which level to use (e.g. with AskUserQuestion; do not offer `ultra`) and use the answer as the default level
 2. Briefly tell the user that you are standing by as a reviewer, and state the default options
 3. Do not start any review yet; wait for a request
 
@@ -58,7 +64,8 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - The full findings, most severe first (file:line, what is wrong, how it breaks)
    - If there are no findings, say so
    - If findings were posted to the PR via `--comment`, say so
-   - If `--fix` was used, say that fixes were applied in this reviewer's working tree and list the changed files
+   - If `--fix` was used, say that fixes were applied in this reviewer's working tree, and include the changed files and the full diff
+   - If `--fix` was requested but dropped, say so and why
 5. Briefly report the result to the user as well, then wait for the next request
 
 ## Notes
