@@ -76,9 +76,9 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 From the second review of the same PR onward, focus on the points raised before. Do not run a full review again: it would keep surfacing new, unrelated findings on every round. The only exception is new changes unrelated to those points (see step 5 below), which have never been reviewed.
 
-A request is a re-review when this session has already reviewed the same PR and sent the results back (even if there were no findings), or when the requester says so and includes the previous findings. The points to check are the ones still open after the latest review (there may be none): the findings of the first review, then whatever remained unresolved or was newly caused by fixes in each re-review.
+A request is a re-review when this session has already reviewed the same PR and sent the results back (even if there were no findings), or when the requester says so and includes the previous findings and the commit last reviewed. The points to check are the ones still open after the latest review (there may be none): the findings of the first review, then whatever remained unresolved or was newly caused by fixes in each re-review.
 
-1. Identify the target and decide the options as in steps 1–2 above. If you have no record of the open points (e.g. this session was restarted), ask the requester to include them; do not silently fall back to a full review
+1. Identify the target and decide the options as in steps 1–2 above. If you have no record of the open points or of the commit you last reviewed (e.g. this session was restarted), ask the requester to include both, even if the previous review had no findings; do not silently fall back to a full review
 2. Fetch the PR's latest head commit as in step 3 above, and look at what changed since the commit you last reviewed
 3. For each open point, check the latest head directly and decide whether it is resolved, partially resolved, or not resolved
 4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything else about the code that was already reviewed
