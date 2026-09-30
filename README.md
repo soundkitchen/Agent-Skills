@@ -27,4 +27,4 @@ ln -s "$PWD/<skill-name>" ~/.claude/skills/<skill-name>
 | skill | 概要 | 使い方 |
 |---|---|---|
 | [you-are-a-reviewer](you-are-a-reviewer/SKILL.md) | セッションをレビュー担当にする。他セッションからの依頼を code-review でレビューし、結果を依頼元に返す。2 回目以降は前回の指摘に絞って確認する | `/you-are-a-reviewer medium --comment`(引数は code-review と同じ。ただし `ultra` と `--fix` は非対応) |
-| [request-review](request-review/SKILL.md) | you-are-a-reviewer のセッションに、今のブランチの PR のレビューを依頼する。`--lgtm` なら LGTM が出るまで修正と再依頼を繰り返す | `/request-review [レビュアー名] [レベル] [--lgtm]`(レビュアー名を省くと、このセッションで前回依頼した相手) |
+| [request-review](request-review/SKILL.md) | you-are-a-reviewer のセッションに、今のブランチの PR のレビューを依頼する。`--lgtm` なら LGTM が出るまで修正と再依頼を繰り返す | `/request-review [レビュアー名] [レベル] [--lgtm]`(レビュアー名を省くと、このセッションで前回依頼した相手)。「レビューを頼んで」のような依頼でも起動する |

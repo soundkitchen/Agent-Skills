@@ -1,8 +1,7 @@
 ---
 name: request-review
-description: Ask a reviewer session (one running the you-are-a-reviewer skill) to review the current branch's PR, via SendMessage. Optionally takes the reviewer's session name, a code-review level for this review, and --lgtm to keep fixing and re-requesting until the reviewer says LGTM.
+description: Ask a reviewer session (another Claude session running the you-are-a-reviewer skill) to review the current branch's PR, via SendMessage. Use when the user asks to request a review from a reviewer or another session, e.g. "レビューを頼んで", "レビューをお願いして", "skill-reviewer にレビュー依頼して", "LGTM が出るまでレビューしてもらって". Not for reviewing code yourself (use code-review for that). Optionally takes the reviewer's session name, a code-review level for this review, and --lgtm to keep fixing and re-requesting until the reviewer says LGTM.
 argument-hint: "[reviewer-name] [low|medium|high|xhigh|max] [--lgtm]"
-disable-model-invocation: true
 ---
 
 # Request a review
@@ -12,6 +11,8 @@ Ask a reviewer session running the `you-are-a-reviewer` skill to review the curr
 ## Arguments
 
 Arguments given: `$ARGUMENTS`
+
+If the skill was invoked from a natural-language request and the arguments are empty, read the same information from the user's message (e.g. a reviewer name, "high で", "LGTM が出るまで" → `--lgtm`).
 
 Parse them as follows (in any order):
 
