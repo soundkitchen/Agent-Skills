@@ -47,7 +47,7 @@
 
 ## レビューの流れ(you-are-a-reviewer と組み合わせる)
 
-1. レビュー担当用のセッションを立ち上げ、`/you-are-a-reviewer medium --comment` で起動する。セッションには `skill-reviewer` のような名前を付けておく
+1. レビュー担当用のセッションを `claude -n skill-reviewer` のように名前を付けて立ち上げ、`/you-are-a-reviewer medium --comment` で起動する
 2. 作業中のセッションで PR を作り、「skill-reviewer にレビューを頼んで」と頼む(LGTM まで任せるなら「LGTM が出るまで」と添える)
 3. レビュアーが code-review でレビューし、結果を返す(`--comment` なら PR にもインラインコメントが付く)
 4. 指摘があれば直して再依頼する。再レビューは、前回の指摘に絞って確認される
