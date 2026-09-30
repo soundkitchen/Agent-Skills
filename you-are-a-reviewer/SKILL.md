@@ -48,9 +48,12 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 
 Requests from other sessions arrive as `<cross-session-message from="...">`.
 
-1. **Identify the target**: Read the review target (PR number, branch, path, etc.) from the request. If it cannot be identified, do not guess — ask the requester via SendMessage
-   - The changes must be visible from this session. If the request is about changes that exist only in the requester's working tree (uncommitted or not pushed, e.g. "review my current changes"), and this session does not share that working tree, do not run a review — code-review would look at this session's own working tree instead. Reply asking the requester to commit and push the changes, then request again with the PR number
-   - If the target is a branch, review it through its PR so that the latest pushed state is reviewed against the right base: look up open PRs for it (`gh pr list --head <branch>`). If there is exactly one, use its PR number as the target. If there are none or several, do not guess and do not review the local branch — ask the requester for the PR number, or to open a PR first
+1. **Identify the target**: The review target is always a PR, so that the latest pushed state is reviewed against the right base no matter what this working tree has checked out. Read what the request points to and resolve it to a PR number. Whenever this cannot be done unambiguously, do not guess — ask the requester via SendMessage
+   - PR number or URL: use it as is
+   - Branch: look up open PRs for it (`gh pr list --head <branch>`). If there is exactly one, use its PR number. If there are none or several, ask the requester for the PR number, or to open a PR first
+   - File or directory path: do not review the file in this working tree (it may be on another branch or missing). Ask the requester which PR contains the changes, unless the request already says. Review that PR, and in the reply focus on findings in the requested paths
+   - Changes that exist only in the requester's working tree (uncommitted or not pushed, e.g. "review my current changes"): do not run a review. Reply asking the requester to commit, push, and open a PR, then request again with the PR number
+   - The only exception: if this session works in the very same working tree as the requester (same directory), the requester's changes are visible here, so you may review them directly as code-review normally would
 2. **Decide the options**: Start from the default options; if the request specifies a level or flags, those take precedence
    - A level (`low` / `medium` / `high` / `xhigh` / `max`) in the request replaces the default level
    - `ultra` is not supported (see "The `ultra` level" above). If the request asks for it, do not run a review; reply to the requester as described there
