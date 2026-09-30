@@ -1,13 +1,13 @@
 ---
 name: you-are-a-reviewer
-description: Make this session a dedicated reviewer. Reviews requested by other sessions are run with the code-review skill, and the results are sent back to the requesting session via SendMessage. Takes the same arguments as code-review (e.g. medium --comment) and passes them through to the review.
-argument-hint: "[low|medium|high|xhigh|max] [--comment] [--fix]"
+description: Make this session a dedicated reviewer. Reviews requested by other sessions are run with the code-review skill, and the results are sent back to the requesting session via SendMessage. Takes the same arguments as code-review (e.g. medium --comment) and passes them through to the review, except `ultra` and `--fix`, which are not supported.
+argument-hint: "[low|medium|high|xhigh|max] [--comment]"
 disable-model-invocation: true
 ---
 
 # Reviewer mode
 
-From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work (the only exception is applying fixes when `--fix` is given; see "The `--fix` flag" below).
+From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work. This session is read-only: never modify the working tree; fixing the findings is the requester's job.
 
 ## Default options
 
@@ -27,14 +27,11 @@ If they contain no level (`low` / `medium` / `high` / `xhigh` / `max`), ask the 
 
 ### The `--fix` flag
 
-`--fix` is passed through to code-review as is. Note that the fixes are applied to **this reviewer session's working tree**, not the requester's. The fixes stay uncommitted there, so the requester cannot pull them. When `--fix` was used, the reply to the requester must say so and include the changed files and the full diff (`git diff`), so the requester can apply them.
+`--fix` is not supported. This reviewer is read-only, and fixes belong in the requester's own working tree (the requester can run `/code-review --fix` there if they want automatic fixes). Applying fixes here would also conflict with git worktrees, since a branch cannot be checked out in two worktrees at once.
 
-Before running with `--fix`, check both of the following in this working tree:
-
-- The target's branch is checked out and up to date with its latest pushed commit (for a PR: the PR's head branch at the PR's head commit)
-- There are no uncommitted changes (e.g. leftover fixes from a previous `--fix` run). Otherwise code-review would review them together with the target, and new fixes would pile on top of old ones
-
-If either check fails, drop `--fix`, run the review without it, and tell the requester that no fixes were applied and why. Do not switch branches or otherwise modify this working tree to make `--fix` possible.
+- If the default options include `--fix`: on startup, tell the user it is not supported and remove it from the default options
+- If a request asks for `--fix`: run the review without it, and tell the requester that `--fix` was dropped and why
+- Never call code-review with `--fix`, wherever the flag came from
 
 ## Project rules
 
@@ -43,8 +40,9 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 ## On startup
 
 1. If the default options contain no level, or contain `ultra`, ask the user which level to use (e.g. with AskUserQuestion; do not offer `ultra`) and use the answer as the default level
-2. Briefly tell the user that you are standing by as a reviewer, and state the default options
-3. Do not start any review yet; wait for a request
+2. If the default options contain `--fix`, tell the user it is not supported and remove it
+3. Briefly tell the user that you are standing by as a reviewer, and state the default options
+4. Do not start any review yet; wait for a request
 
 ## When a review request arrives
 
@@ -55,7 +53,8 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
 2. **Decide the options**: Start from the default options; if the request specifies a level or flags, those take precedence
    - A level (`low` / `medium` / `high` / `xhigh` / `max`) in the request replaces the default level
    - `ultra` is not supported (see "The `ultra` level" above). If the request asks for it, do not run a review; reply to the requester as described there
-   - Flags (`--comment`, `--fix`, etc.) explicitly added or removed in the request are applied accordingly
+   - Flags (e.g. `--comment`) explicitly added or removed in the request are applied accordingly
+   - `--fix` is not supported (see "The `--fix` flag" above). If the request asks for it, drop it and continue
 3. **Run code-review**: Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
 4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
@@ -64,8 +63,7 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - The full findings, most severe first (file:line, what is wrong, how it breaks)
    - If there are no findings, say so
    - If findings were posted to the PR via `--comment`, say so
-   - If `--fix` was used, say that fixes were applied in this reviewer's working tree, and include the changed files and the full diff
-   - If `--fix` was requested but dropped, say so and why
+   - If `--fix` was requested, say that it was dropped and why
 5. Briefly report the result to the user as well, then wait for the next request
 
 ## Notes
