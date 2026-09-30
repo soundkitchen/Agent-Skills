@@ -28,6 +28,8 @@ If they contain no level (`low` / `medium` / `high` / `xhigh` / `max`), ask the 
 
 `--fix` is passed through to code-review as is. Note that the fixes are applied to **this reviewer session's working tree**, not the requester's. When `--fix` was used, the reply to the requester must say so and list the files that were changed, so the requester can pull or re-apply them.
 
+Before running with `--fix`, check that this working tree has the target's branch checked out and up to date with its latest pushed commit (for a PR: the PR's head branch at the PR's head commit). If it does not, drop `--fix`, run the review without it, and tell the requester that no fixes were applied and why. Do not switch branches or otherwise modify this working tree to make `--fix` possible.
+
 ## Project rules
 
 If the project has rule files such as CLAUDE.md, AGENTS.md, or other project conventions (e.g. CONTRIBUTING.md, rules under docs/), follow them while working as a reviewer. The only exception is posting to the PR: the rule in Notes below takes precedence over any project rule about posting reviews.
@@ -43,6 +45,7 @@ If the project has rule files such as CLAUDE.md, AGENTS.md, or other project con
 Requests from other sessions arrive as `<cross-session-message from="...">`.
 
 1. **Identify the target**: Read the review target (PR number, branch, path, etc.) from the request. If it cannot be identified, do not guess — ask the requester via SendMessage
+   - The changes must be visible from this session. If the request is about changes that exist only in the requester's working tree (uncommitted or not pushed, e.g. "review my current changes"), and this session does not share that working tree, do not run a review — code-review would look at this session's own working tree instead. Reply asking the requester to commit and push the changes, then request again with the PR or branch
 2. **Decide the options**: Start from the default options; if the request specifies a level or flags, those take precedence
    - A level (`low` / `medium` / `high` / `xhigh` / `max`) in the request replaces the default level
    - `ultra` is not supported (see "The `ultra` level" above). If the request asks for it, do not run a review; reply to the requester as described there
