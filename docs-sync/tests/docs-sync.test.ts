@@ -205,6 +205,18 @@ describe('parsePrCreate', () => {
     expect(parsePrCreate('gh pr create --body "`date` \\"x\\"" --base develop')).toEqual({ cds: [], base: 'develop', head: undefined })
   })
 
+  test('finds gh pr create run inside $(...) or backticks', async () => {
+    expect(parsePrCreate('PR_URL=$(gh pr create --fill --base develop) && echo "$PR_URL"')).toEqual({ cds: [], base: 'develop', head: undefined })
+    expect(parsePrCreate('echo "created: $(gh pr create --fill)"')).toEqual({ cds: [], base: undefined, head: undefined })
+    expect(parsePrCreate('url=`gh pr create --fill -B develop`')).toEqual({ cds: [], base: 'develop', head: undefined })
+    expect(parsePrCreate('gh pr view "$(gh pr create --fill)" --web')).toEqual({ cds: [], base: undefined, head: undefined })
+  })
+
+  test('does not find gh pr create in a heredoc body inside $(...)', async () => {
+    expect(parsePrCreate(`echo --body "$(cat <<'EOF'\ngh pr create --base x\nEOF\n)"`)).toBe(undefined)
+    expect(parsePrCreate(`gh pr view --body "$(cat <<'EOF'\ngh pr create --base x\nEOF\n)"`)).toBe(undefined)
+  })
+
   test('finds gh pr create behind env, command, time, nohup and exec', async () => {
     for (const prefix of ['env GH_HOST=x', 'env -i -u FOO --', 'command', 'time -p', 'nohup', 'exec', 'A=1 env B=2 time']) {
       expect(parsePrCreate(`${prefix} gh pr create --fill`)).toEqual({ cds: [], base: undefined, head: undefined })

@@ -28,7 +28,8 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
 
 - **割り込むのは、実際に `gh pr create` を実行するときだけ。**
   - 対象は Claude の Bash ツールの呼び出し。コマンドを `&&` `;` `|` などで区切り、`gh pr create` で始まる部分があるものだけを判定する(`git push && gh pr create ...` のような連結も含む)。先頭の環境変数の指定(`NAME=value`)や、`env` `command` `time` `nohup` `exec` の前置きは飛ばして見る
-  - 引用符・ヒアドキュメント・`$(...)` の中の文字列には反応しない。コミットメッセージや PR へのコメントの本文に「gh pr create」と書いてあっても、判定しない。`--title` や `--body` の値も、`--base` / `--head` として読まない
+  - `$(...)` やバッククォートの中で実行される `gh pr create` も対象(`PR_URL=$(gh pr create ...)` など)
+  - 引用符・ヒアドキュメントの中の文字列には反応しない。コミットメッセージや PR へのコメントの本文に「gh pr create」と書いてあっても、判定しない。`--title` や `--body` の値も、`--base` / `--head` として読まない
   - `gh pr create --help` も判定しない
   - ユーザーが自分のターミナルで実行したコマンドや、GitHub の画面・MCP ツールで作る PR は対象外
 - **比べるのは、PR に入るコミット済みの内容。**

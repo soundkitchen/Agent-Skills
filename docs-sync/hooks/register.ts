@@ -323,8 +323,8 @@ function parseCreateArgs(args: string[]): { base?: string; head?: string; help: 
 type Heredoc = { delim: string; strip: boolean }
 
 // シェルのコマンドを、&& ; | ( ) 改行で区切られた単語の列に分ける。
-// 引用符は外して 1 つの単語にし、$(...) とバッククォートは中身ごと 1 つの単語の一部にする。
-// ヒアドキュメントの本文とコメントは読み飛ばす
+// 引用符は外して 1 つの単語にする。$(...) とバッククォートは中身ごと 1 つの単語の一部にしたうえで、
+// 中で実行されるコマンドも区切りとして加える。ヒアドキュメントの本文とコメントは読み飛ばす
 export function splitCommand(command: string): string[][] {
   const segments: string[][] = []
   let words: string[] = []
@@ -353,17 +353,19 @@ export function splitCommand(command: string): string[][] {
       inWord = true
       i = end + 1
     } else if (c === '"') {
-      const r = scanDouble(command, i)
+      const r = scanDouble(command, i, segments)
       word += r.text
       inWord = true
       i = r.end
     } else if (c === '$' && command[i + 1] === '(') {
       const end = scanSubst(command, i + 2)
+      segments.push(...splitCommand(substBody(command, i + 2, end)))
       word += command.slice(i, end)
       inWord = true
       i = end
     } else if (c === '`') {
       const end = scanBacktick(command, i)
+      segments.push(...splitCommand(substBody(command, i + 1, end, '`')))
       word += command.slice(i, end)
       inWord = true
       i = end
@@ -400,8 +402,9 @@ export function splitCommand(command: string): string[][] {
   return segments
 }
 
-// i は開きの " の位置。閉じの " の次の位置と、中身を返す。中の $(...) とバッククォートは入れ子として読む
-function scanDouble(s: string, i: number): { end: number; text: string } {
+// i は開きの " の位置。閉じの " の次の位置と、中身を返す。中の $(...) とバッククォートは入れ子として読み、
+// nested があれば、その中で実行されるコマンドの区切りを加える
+function scanDouble(s: string, i: number, nested?: string[][]): { end: number; text: string } {
   let text = ''
   let j = i + 1
   while (j < s.length && s[j] !== '"') {
@@ -411,10 +414,12 @@ function scanDouble(s: string, i: number): { end: number; text: string } {
       j += 2
     } else if (c === '$' && s[j + 1] === '(') {
       const end = scanSubst(s, j + 2)
+      nested?.push(...splitCommand(substBody(s, j + 2, end)))
       text += s.slice(j, end)
       j = end
     } else if (c === '`') {
       const end = scanBacktick(s, j)
+      nested?.push(...splitCommand(substBody(s, j + 1, end, '`')))
       text += s.slice(j, end)
       j = end
     } else {
@@ -423,6 +428,11 @@ function scanDouble(s: string, i: number): { end: number; text: string } {
     }
   }
   return { end: j + 1, text }
+}
+
+// コマンド置換の中身。start は中身の先頭、end は閉じ(close)の次の位置。閉じていなければ末尾まで
+function substBody(s: string, start: number, end: number, close = ')'): string {
+  return s.slice(start, s[end - 1] === close ? end - 1 : end)
 }
 
 // i は $( の中身の先頭。対応する ) の次の位置を返す。中の引用符・ヒアドキュメント・入れ子の括弧を考慮する
