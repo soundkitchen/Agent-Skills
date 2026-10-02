@@ -1,14 +1,12 @@
 import type { EngineInterface, Register } from 'claude-code'
 
-// PR 作成とみなすコマンド。`git push && gh pr create ...` のような連結も拾う
-const PR_CREATE = /(^|[\s;&|(])gh\s+pr\s+create(\s|$)/
 // 判定の上限。モデルは作業中のセッションと同じものを使う
 const MAX_TOKENS = 4096
 const JUDGE_TIMEOUT_MS = 5 * 60 * 1000
 // 1 回の判定に渡すテキストの上限(文字数)。超えたら関係するドキュメントを先に選ばせる
 const PROMPT_BUDGET = 300_000
 // 判定の対象にするドキュメント
-const DOC_PATHSPECS = ['*.md', '*.mdx']
+const DOC_FILE = /\.mdx?$/
 
 const ASK_CONTINUE = 'このまま PR を作成する'
 const ASK_CANCEL = '中止する'
@@ -16,17 +14,20 @@ const ASK_CANCEL = '中止する'
 type Finding = { doc: string; issue: string; fix: string }
 type Verdict = { status: 'ok' } | { status: 'drift'; findings: Finding[] }
 type Doc = { path: string; text: string }
+// コマンドから読み取った PR 作成の内容
+export type PrCreate = { cds: string[]; base?: string; head?: string }
 
 // 判定できなかったことを表す。ユーザーに続けるか聞く
 class CheckFailed extends Error {}
 
 export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
-    if (!PR_CREATE.test(e.command)) return next(e)
+    const pr = parsePrCreate(e.command)
+    if (pr === undefined) return next(e)
 
     let verdict: Verdict
     try {
-      verdict = await check($, e.command, next.signal)
+      verdict = await check($, pr, next.signal)
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
       return (await confirmAfterFailure($, reason)) ? next(e) : { deny: failureDeny(reason) }
@@ -40,40 +41,46 @@ export const register: Register = on => {
   })
 }
 
-// ブランチの差分とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる
-async function check($: EngineInterface, command: string, signal: AbortSignal): Promise<Verdict> {
-  const root = await git($, ['rev-parse', '--show-toplevel'], await $.session.cwd())
-  if (root === undefined) throw new CheckFailed('not inside a git repository')
+// PR に入る内容(base...head の差分)とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる
+async function check($: EngineInterface, pr: PrCreate, signal: AbortSignal): Promise<Verdict> {
+  const cwd = await resolveCwd($, pr.cds)
+  const root = await git($, ['rev-parse', '--show-toplevel'], cwd)
+  if (root === undefined) throw new CheckFailed(`not inside a git repository (${cwd})`)
 
-  const head = await git($, ['rev-parse', 'HEAD'], root)
-  if (head === undefined) throw new CheckFailed('could not resolve HEAD')
+  const head = await resolveHead($, root, pr.head)
+  if (head === undefined) throw new CheckFailed(`could not resolve the head ${pr.head ?? 'HEAD'}`)
 
-  const base = await resolveBase($, root, parseBaseFlag(command))
-  if (base === undefined) throw new CheckFailed('could not resolve the base branch; pass --base')
+  const base = await resolveBase($, root, pr.base)
+  if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base ?? ''}`.trim())
 
-  // 同じコミット・同じ base で一度通ったものは判定し直さない
-  const cacheKey = `pass:${root}:${base}:${head}`
-  if ((await $.store.get(cacheKey)) === true) return { status: 'ok' }
+  // 同じ base で最後に通ったコミットと同じなら判定し直さない
+  const cacheKey = `pass:${root}:${base}`
+  if ((await $.store.get(cacheKey)) === head) return { status: 'ok' }
 
-  const diff = await git($, ['diff', '--no-color', `${base}...HEAD`], root)
-  if (diff === undefined) throw new CheckFailed(`git diff ${base}...HEAD failed`)
+  const diff = await git($, ['diff', '--no-color', `${base}...${head}`], root)
+  if (diff === undefined) throw new CheckFailed(`git diff ${base}...${head} failed`)
   if (diff.trim() === '') return { status: 'ok' }
   if (diff.length > PROMPT_BUDGET) throw new CheckFailed('the diff is too large to check')
 
-  const docs = await readDocs($, root)
+  const docs = await readDocs($, root, head)
   if (docs.length === 0) return { status: 'ok' }
 
   // 実装を読む判定なので、作業中のセッションと同じモデルで見る
   const model = await $.session.model()
-  const changed = (await git($, ['diff', '--name-only', `${base}...HEAD`], root)) ?? ''
+  const changed = (await git($, ['diff', '--name-only', `${base}...${head}`], root)) ?? ''
   const selected = await selectDocs($, model, docs, diff, changed, signal)
   const verdict = await judge($, model, selected, diff, signal)
 
-  if (verdict.status === 'ok') await $.store.set(cacheKey, true)
+  if (verdict.status === 'ok') {
+    // 記録できなくても判定結果は変えない(次回また判定するだけ)
+    try {
+      await $.store.set(cacheKey, head)
+    } catch {}
+  }
   return verdict
 }
 
-// git を root で実行し、成功したら stdout を返す
+// git を cwd で実行し、成功したら stdout を返す
 async function git($: EngineInterface, args: string[], cwd: string): Promise<string | undefined> {
   try {
     const r = await $.process.run(['git', ...args], { cwd })
@@ -82,6 +89,29 @@ async function git($: EngineInterface, args: string[], cwd: string): Promise<str
   } catch {
     return undefined
   }
+}
+
+// コマンド内の cd を順にたどり、gh pr create が実行される場所を求める
+async function resolveCwd($: EngineInterface, cds: string[]): Promise<string> {
+  let cwd = await $.session.cwd()
+  for (const dir of cds) {
+    let target = dir
+    if (target === '' || target === '~' || target.startsWith('~/')) {
+      const home = await $.env.get('HOME')
+      if (home === undefined) throw new CheckFailed('could not resolve ~ in cd')
+      target = home + target.slice(1)
+    }
+    cwd = target.startsWith('/') ? target : `${cwd}/${target}`
+  }
+  return cwd
+}
+
+// PR の head のコミット。--head があれば push 済みの origin/<branch> を優先し、なければ HEAD
+async function resolveHead($: EngineInterface, root: string, flag: string | undefined): Promise<string | undefined> {
+  if (flag === undefined) return git($, ['rev-parse', 'HEAD'], root)
+  // fork の `owner:branch` はブランチ名だけを使う
+  const branch = flag.includes(':') ? flag.slice(flag.indexOf(':') + 1) : flag
+  return firstCommit($, root, [`origin/${branch}`, branch])
 }
 
 // --base の指定があれば origin/<base> を優先し、なければ origin の既定ブランチを使う
@@ -98,14 +128,23 @@ async function resolveBase($: EngineInterface, root: string, flag: string | unde
   return undefined
 }
 
-// HEAD 時点のドキュメントを読む。PR に入るのはコミット済みの内容なので、作業ツリーではなく HEAD から読む
-async function readDocs($: EngineInterface, root: string): Promise<Doc[]> {
-  const list = await git($, ['ls-files', '--', ...DOC_PATHSPECS], root)
-  if (list === undefined) throw new CheckFailed('git ls-files failed')
-  const paths = list.split('\n').filter(p => p !== '')
+// 候補のうち最初に解決できた ref のコミット
+async function firstCommit($: EngineInterface, root: string, refs: string[]): Promise<string | undefined> {
+  for (const ref of refs) {
+    const sha = await git($, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], root)
+    if (sha !== undefined) return sha
+  }
+  return undefined
+}
+
+// head のコミット時点のドキュメントを読む。PR に入るのはコミット済みの内容なので、作業ツリーからは読まない
+async function readDocs($: EngineInterface, root: string, head: string): Promise<Doc[]> {
+  const list = await git($, ['ls-tree', '-r', '--name-only', head], root)
+  if (list === undefined) throw new CheckFailed('git ls-tree failed')
+  const paths = list.split('\n').filter(p => DOC_FILE.test(p))
   const docs: Doc[] = []
   for (const path of paths) {
-    const text = await git($, ['show', `HEAD:${path}`], root)
+    const text = await git($, ['show', `${head}:${path}`], root)
     if (text !== undefined) docs.push({ path, text })
   }
   return docs
@@ -130,16 +169,19 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], diff: 
 
   const wanted = parseJson(r.text)
   if (!Array.isArray(wanted)) throw new CheckFailed('could not read the model reply')
-  const picked = docs.filter(d => wanted.includes(d.path))
+  const names = new Set(wanted.map(p => normalizePath(String(p))))
+  const picked = docs.filter(d => names.has(d.path))
 
-  // 選ばれたものでも予算を超えるなら、先頭から入る分だけにする
+  // 予算に入るものだけを渡す。入らない大きなものは飛ばし、後ろのものは続けて入れる
   const out: Doc[] = []
   let used = diff.length
   for (const d of picked) {
-    if (used + d.text.length > PROMPT_BUDGET) break
+    if (used + d.text.length > PROMPT_BUDGET) continue
     out.push(d)
     used += d.text.length
   }
+  // 1 件も渡せないなら、ドキュメントなしで「ずれなし」と判定してしまうので、判定できない扱いにする
+  if (out.length === 0) throw new CheckFailed('no documents could be selected for the check')
   return out
 }
 
@@ -182,10 +224,126 @@ async function confirmAfterFailure($: EngineInterface, reason: string): Promise<
   }
 }
 
-// --base / -B の値を取り出す
-export function parseBaseFlag(command: string): string | undefined {
-  const m = /(?:--base(?:=|\s+)|-B\s+)(["']?)([^\s"']+)\1/.exec(command)
-  return m?.[2]
+// コマンドが gh pr create を実行するなら、その内容を返す。引用符やヒアドキュメントの中の文字列には反応しない
+export function parsePrCreate(command: string): PrCreate | undefined {
+  const cds: string[] = []
+  for (const segment of splitCommand(command)) {
+    // 先頭の `NAME=value` は環境変数の指定なので飛ばす
+    const start = segment.findIndex(w => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w))
+    const words = start < 0 ? [] : segment.slice(start)
+    if (words[0] === 'cd') {
+      if (words[1] !== '-') cds.push(words[1] ?? '')
+      continue
+    }
+    if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'create') continue
+    const args = words.slice(3)
+    if (args.includes('--help') || args.includes('-h')) return undefined
+    return { cds, base: flagValue(args, '--base', '-B'), head: flagValue(args, '--head', '-H') }
+  }
+  return undefined
+}
+
+// `--name value` / `--name=value` / `-x value` / `-xvalue` の値を返す
+function flagValue(args: string[], long: string, short: string): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (a === long || a === short) return args[i + 1]
+    if (a.startsWith(`${long}=`)) return a.slice(long.length + 1)
+    if (a.startsWith(short) && a.length > short.length && !a.startsWith('--')) return a.slice(short.length)
+  }
+  return undefined
+}
+
+// シェルのコマンドを、&& ; | ( ) 改行で区切られた単語の列に分ける。
+// 引用符は外して 1 つの単語にし、ヒアドキュメントの本文とコメントは読み飛ばす
+export function splitCommand(command: string): string[][] {
+  const segments: string[][] = []
+  let words: string[] = []
+  let word = ''
+  let inWord = false
+  const heredocs: { delim: string; strip: boolean }[] = []
+
+  const endWord = () => {
+    if (inWord) words.push(word)
+    word = ''
+    inWord = false
+  }
+  const endSegment = () => {
+    endWord()
+    if (words.length > 0) segments.push(words)
+    words = []
+  }
+
+  let i = 0
+  while (i < command.length) {
+    const c = command[i]!
+    if (c === "'") {
+      const close = command.indexOf("'", i + 1)
+      const end = close < 0 ? command.length : close
+      word += command.slice(i + 1, end)
+      inWord = true
+      i = end + 1
+    } else if (c === '"') {
+      let j = i + 1
+      while (j < command.length && command[j] !== '"') {
+        if (command[j] === '\\' && j + 1 < command.length) {
+          word += command[j + 1]
+          j += 2
+        } else {
+          word += command[j]
+          j += 1
+        }
+      }
+      inWord = true
+      i = j + 1
+    } else if (c === '\\') {
+      if (i + 1 < command.length && command[i + 1] !== '\n') {
+        word += command[i + 1]
+        inWord = true
+      }
+      i += 2
+    } else if (c === '#' && !inWord) {
+      while (i < command.length && command[i] !== '\n') i += 1
+    } else if (c === '\n') {
+      endSegment()
+      i += 1
+      // 改行のあとはヒアドキュメントの本文。終わりの行まで読み飛ばす
+      for (const h of heredocs) {
+        while (i < command.length) {
+          const eol = command.indexOf('\n', i)
+          const lineEnd = eol < 0 ? command.length : eol
+          const line = command.slice(i, lineEnd)
+          i = lineEnd + 1
+          if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) break
+        }
+      }
+      heredocs.length = 0
+    } else if (c === '<' && command.startsWith('<<', i) && !command.startsWith('<<<', i)) {
+      endWord()
+      i += 2
+      const strip = command[i] === '-'
+      if (strip) i += 1
+      while (command[i] === ' ' || command[i] === '\t') i += 1
+      let delim = ''
+      while (i < command.length && !/[\s;&|()<>]/.test(command[i]!)) {
+        if (command[i] !== '"' && command[i] !== "'") delim += command[i]
+        i += 1
+      }
+      heredocs.push({ delim, strip })
+    } else if (';&|()'.includes(c)) {
+      endSegment()
+      i += 1
+    } else if (/\s/.test(c)) {
+      endWord()
+      i += 1
+    } else {
+      word += c
+      inWord = true
+      i += 1
+    }
+  }
+  endSegment()
+  return segments
 }
 
 // 返答から最初の JSON 値を取り出す。コードブロックで囲まれていてもよい
@@ -200,6 +358,10 @@ export function parseJson(text: string): unknown {
   } catch {
     return undefined
   }
+}
+
+function normalizePath(path: string): string {
+  return path.trim().replace(/^\.\//, '')
 }
 
 export function driftDeny(findings: Finding[]): string {
@@ -246,7 +408,7 @@ or
 
 const SELECT_SYSTEM = `You pick which documents might need an update for a code change.
 
-Reply with a JSON array of document paths only, no prose. Include project instruction files (such as CLAUDE.md or AGENTS.md) and any document that describes the changed files, their behavior, or lists the components they belong to.`
+Reply with a JSON array of document paths only, exactly as listed, no prose. Include project instruction files (such as CLAUDE.md or AGENTS.md) and any document that describes the changed files, their behavior, or lists the components they belong to.`
 
 function judgePrompt(docs: Doc[], diff: string): string {
   const docBlocks = docs.map(d => `<document path="${d.path}">\n${d.text}\n</document>`).join('\n\n')
