@@ -197,6 +197,27 @@ describe('parsePrCreate', () => {
     expect(parsePrCreate('cd a && cd b; GH_HOST=x gh pr create')).toEqual({ cds: ['a', 'b'], base: undefined, head: undefined })
   })
 
+  test('reads flags after a $(cat <<EOF ...) body that holds a double quote', async () => {
+    const command = `gh pr create --title "t" --body "$(cat <<'EOF'\n画面は 27" 以上を想定 (例)\nEOF\n)" --base develop`
+    expect(parsePrCreate(command)).toEqual({ cds: [], base: 'develop', head: undefined })
+    const unquoted = `gh pr create --body $(cat <<'EOF'\n27" --base wrong\nEOF\n) -B develop`
+    expect(parsePrCreate(unquoted)).toEqual({ cds: [], base: 'develop', head: undefined })
+    expect(parsePrCreate('gh pr create --body "`date` \\"x\\"" --base develop')).toEqual({ cds: [], base: 'develop', head: undefined })
+  })
+
+  test('finds gh pr create behind env, command, time, nohup and exec', async () => {
+    for (const prefix of ['env GH_HOST=x', 'env -i -u FOO --', 'command', 'time -p', 'nohup', 'exec', 'A=1 env B=2 time']) {
+      expect(parsePrCreate(`${prefix} gh pr create --fill`)).toEqual({ cds: [], base: undefined, head: undefined })
+    }
+  })
+
+  test('does not read the values of other flags as --base or --head', async () => {
+    expect(parsePrCreate('gh pr create --title "-Hotfix" --fill')).toEqual({ cds: [], base: undefined, head: undefined })
+    expect(parsePrCreate('gh pr create -b "-Bump deps" -t -h')).toEqual({ cds: [], base: undefined, head: undefined })
+    expect(parsePrCreate('gh pr create -dBmain -Hfeat')).toEqual({ cds: [], base: 'main', head: 'feat' })
+    expect(parsePrCreate('gh pr create -B=main --head=feat')).toEqual({ cds: [], base: 'main', head: 'feat' })
+  })
+
   test('returns nothing when gh pr create is not run', async () => {
     expect(parsePrCreate('echo "gh pr create"')).toBe(undefined)
     expect(parsePrCreate('gh pr create --help')).toBe(undefined)

@@ -228,40 +228,109 @@ async function confirmAfterFailure($: EngineInterface, reason: string): Promise<
 export function parsePrCreate(command: string): PrCreate | undefined {
   const cds: string[] = []
   for (const segment of splitCommand(command)) {
-    // 先頭の `NAME=value` は環境変数の指定なので飛ばす
-    const start = segment.findIndex(w => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(w))
-    const words = start < 0 ? [] : segment.slice(start)
+    const words = stripPrefixes(segment)
     if (words[0] === 'cd') {
       if (words[1] !== '-') cds.push(words[1] ?? '')
       continue
     }
     if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'create') continue
-    const args = words.slice(3)
-    if (args.includes('--help') || args.includes('-h')) return undefined
-    return { cds, base: flagValue(args, '--base', '-B'), head: flagValue(args, '--head', '-H') }
+    const args = parseCreateArgs(words.slice(3))
+    if (args.help) return undefined
+    return { cds, base: args.base, head: args.head }
   }
   return undefined
 }
 
-// `--name value` / `--name=value` / `-x value` / `-xvalue` の値を返す
-function flagValue(args: string[], long: string, short: string): string | undefined {
+// 先頭の環境変数の指定(NAME=value)と、env・command・time などの前置きを飛ばす
+function stripPrefixes(segment: string[]): string[] {
+  const isAssign = (w: string) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(w)
+  let i = 0
+  while (i < segment.length) {
+    const w = segment[i]!
+    if (isAssign(w)) {
+      i += 1
+    } else if (w === 'env') {
+      i += 1
+      while (i < segment.length) {
+        const a = segment[i]!
+        if (a === '--') {
+          i += 1
+          break
+        }
+        if (['-u', '--unset', '-C', '--chdir', '-S', '--split-string'].includes(a)) i += 2
+        else if (a.startsWith('-') || isAssign(a)) i += 1
+        else break
+      }
+    } else if (['command', 'time', 'nohup', 'exec'].includes(w)) {
+      i += 1
+      while (i < segment.length && segment[i]!.startsWith('-')) i += 1
+    } else {
+      break
+    }
+  }
+  return segment.slice(i)
+}
+
+// gh pr create のフラグのうち、値を取るもの(短い形 → 長い形)
+const VALUE_FLAGS: Record<string, string> = {
+  a: 'assignee',
+  B: 'base',
+  b: 'body',
+  F: 'body-file',
+  H: 'head',
+  l: 'label',
+  m: 'milestone',
+  p: 'project',
+  R: 'repo',
+  r: 'reviewer',
+  T: 'template',
+  t: 'title',
+}
+const LONG_VALUE_FLAGS = new Set([...Object.values(VALUE_FLAGS), 'recover'])
+
+// gh pr create の引数から --base / --head / --help を読む。ほかのフラグの値(--title "-Hotfix" など)は読み飛ばす
+function parseCreateArgs(args: string[]): { base?: string; head?: string; help: boolean } {
+  const values: Record<string, string> = {}
+  let help = false
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!
-    if (a === long || a === short) return args[i + 1]
-    if (a.startsWith(`${long}=`)) return a.slice(long.length + 1)
-    if (a.startsWith(short) && a.length > short.length && !a.startsWith('--')) return a.slice(short.length)
+    if (a === '--') break
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=')
+      const name = eq < 0 ? a.slice(2) : a.slice(2, eq)
+      if (name === 'help') help = true
+      if (LONG_VALUE_FLAGS.has(name)) {
+        const v = eq < 0 ? args[++i] : a.slice(eq + 1)
+        if (v !== undefined) values[name] = v
+      }
+    } else if (a.startsWith('-') && a.length > 1) {
+      // `-dBmain` のような短いフラグの連結も読む
+      for (let k = 1; k < a.length; k++) {
+        const ch = a[k]!
+        if (ch === 'h') help = true
+        const name = VALUE_FLAGS[ch]
+        if (name === undefined) continue
+        const rest = a.slice(k + 1)
+        const v = rest !== '' ? rest.replace(/^=/, '') : args[++i]
+        if (v !== undefined) values[name] = v
+        break
+      }
+    }
   }
-  return undefined
+  return { base: values['base'], head: values['head'], help }
 }
 
+type Heredoc = { delim: string; strip: boolean }
+
 // シェルのコマンドを、&& ; | ( ) 改行で区切られた単語の列に分ける。
-// 引用符は外して 1 つの単語にし、ヒアドキュメントの本文とコメントは読み飛ばす
+// 引用符は外して 1 つの単語にし、$(...) とバッククォートは中身ごと 1 つの単語の一部にする。
+// ヒアドキュメントの本文とコメントは読み飛ばす
 export function splitCommand(command: string): string[][] {
   const segments: string[][] = []
   let words: string[] = []
   let word = ''
   let inWord = false
-  const heredocs: { delim: string; strip: boolean }[] = []
+  const heredocs: Heredoc[] = []
 
   const endWord = () => {
     if (inWord) words.push(word)
@@ -284,18 +353,20 @@ export function splitCommand(command: string): string[][] {
       inWord = true
       i = end + 1
     } else if (c === '"') {
-      let j = i + 1
-      while (j < command.length && command[j] !== '"') {
-        if (command[j] === '\\' && j + 1 < command.length) {
-          word += command[j + 1]
-          j += 2
-        } else {
-          word += command[j]
-          j += 1
-        }
-      }
+      const r = scanDouble(command, i)
+      word += r.text
       inWord = true
-      i = j + 1
+      i = r.end
+    } else if (c === '$' && command[i + 1] === '(') {
+      const end = scanSubst(command, i + 2)
+      word += command.slice(i, end)
+      inWord = true
+      i = end
+    } else if (c === '`') {
+      const end = scanBacktick(command, i)
+      word += command.slice(i, end)
+      inWord = true
+      i = end
     } else if (c === '\\') {
       if (i + 1 < command.length && command[i + 1] !== '\n') {
         word += command[i + 1]
@@ -306,30 +377,13 @@ export function splitCommand(command: string): string[][] {
       while (i < command.length && command[i] !== '\n') i += 1
     } else if (c === '\n') {
       endSegment()
-      i += 1
-      // 改行のあとはヒアドキュメントの本文。終わりの行まで読み飛ばす
-      for (const h of heredocs) {
-        while (i < command.length) {
-          const eol = command.indexOf('\n', i)
-          const lineEnd = eol < 0 ? command.length : eol
-          const line = command.slice(i, lineEnd)
-          i = lineEnd + 1
-          if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) break
-        }
-      }
+      i = skipHeredocBodies(command, i + 1, heredocs)
       heredocs.length = 0
     } else if (c === '<' && command.startsWith('<<', i) && !command.startsWith('<<<', i)) {
       endWord()
-      i += 2
-      const strip = command[i] === '-'
-      if (strip) i += 1
-      while (command[i] === ' ' || command[i] === '\t') i += 1
-      let delim = ''
-      while (i < command.length && !/[\s;&|()<>]/.test(command[i]!)) {
-        if (command[i] !== '"' && command[i] !== "'") delim += command[i]
-        i += 1
-      }
-      heredocs.push({ delim, strip })
+      const r = readHeredocOp(command, i)
+      heredocs.push(r.heredoc)
+      i = r.end
     } else if (';&|()'.includes(c)) {
       endSegment()
       i += 1
@@ -344,6 +398,104 @@ export function splitCommand(command: string): string[][] {
   }
   endSegment()
   return segments
+}
+
+// i は開きの " の位置。閉じの " の次の位置と、中身を返す。中の $(...) とバッククォートは入れ子として読む
+function scanDouble(s: string, i: number): { end: number; text: string } {
+  let text = ''
+  let j = i + 1
+  while (j < s.length && s[j] !== '"') {
+    const c = s[j]!
+    if (c === '\\' && j + 1 < s.length) {
+      text += s[j + 1]
+      j += 2
+    } else if (c === '$' && s[j + 1] === '(') {
+      const end = scanSubst(s, j + 2)
+      text += s.slice(j, end)
+      j = end
+    } else if (c === '`') {
+      const end = scanBacktick(s, j)
+      text += s.slice(j, end)
+      j = end
+    } else {
+      text += c
+      j += 1
+    }
+  }
+  return { end: j + 1, text }
+}
+
+// i は $( の中身の先頭。対応する ) の次の位置を返す。中の引用符・ヒアドキュメント・入れ子の括弧を考慮する
+function scanSubst(s: string, i: number): number {
+  let depth = 1
+  let j = i
+  const heredocs: Heredoc[] = []
+  while (j < s.length) {
+    const c = s[j]!
+    if (c === "'") {
+      const close = s.indexOf("'", j + 1)
+      j = close < 0 ? s.length : close + 1
+    } else if (c === '"') {
+      j = scanDouble(s, j).end
+    } else if (c === '`') {
+      j = scanBacktick(s, j)
+    } else if (c === '\\') {
+      j += 2
+    } else if (c === '<' && s.startsWith('<<', j) && !s.startsWith('<<<', j)) {
+      const r = readHeredocOp(s, j)
+      heredocs.push(r.heredoc)
+      j = r.end
+    } else if (c === '\n') {
+      j = skipHeredocBodies(s, j + 1, heredocs)
+      heredocs.length = 0
+    } else if (c === '(') {
+      depth += 1
+      j += 1
+    } else if (c === ')') {
+      depth -= 1
+      j += 1
+      if (depth === 0) return j
+    } else {
+      j += 1
+    }
+  }
+  return s.length
+}
+
+// i は開きのバッククォートの位置。閉じの次の位置を返す
+function scanBacktick(s: string, i: number): number {
+  let j = i + 1
+  while (j < s.length && s[j] !== '`') j += s[j] === '\\' ? 2 : 1
+  return j + 1
+}
+
+// i は << の位置。ヒアドキュメントの区切り語と、その次の位置を返す
+function readHeredocOp(s: string, i: number): { heredoc: Heredoc; end: number } {
+  let j = i + 2
+  const strip = s[j] === '-'
+  if (strip) j += 1
+  while (s[j] === ' ' || s[j] === '\t') j += 1
+  let delim = ''
+  while (j < s.length && !/[\s;&|()<>]/.test(s[j]!)) {
+    if (s[j] !== '"' && s[j] !== "'" && s[j] !== '\\') delim += s[j]
+    j += 1
+  }
+  return { heredoc: { delim, strip }, end: j }
+}
+
+// i は改行の次の位置。続くヒアドキュメントの本文を、それぞれの区切り行まで読み飛ばす
+function skipHeredocBodies(s: string, i: number, heredocs: Heredoc[]): number {
+  let j = i
+  for (const h of heredocs) {
+    while (j < s.length) {
+      const eol = s.indexOf('\n', j)
+      const lineEnd = eol < 0 ? s.length : eol
+      const line = s.slice(j, lineEnd)
+      j = lineEnd + 1
+      if ((h.strip ? line.replace(/^\t+/, '') : line) === h.delim) break
+    }
+  }
+  return Math.min(j, s.length)
 }
 
 // 返答から最初の JSON 値を取り出す。コードブロックで囲まれていてもよい
