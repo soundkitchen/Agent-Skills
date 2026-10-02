@@ -1,0 +1,4 @@
+{
+  "description": "The docs-sync hooks module",
+  "modules": ["./register.ts"]
+}
