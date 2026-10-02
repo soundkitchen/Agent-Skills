@@ -226,9 +226,19 @@ async function confirmAfterFailure($: EngineInterface, reason: string): Promise<
 
 // コマンドが gh pr create を実行するなら、その内容を返す。引用符やヒアドキュメントの中の文字列には反応しない
 export function parsePrCreate(command: string): PrCreate | undefined {
-  const cds: string[] = []
-  for (const segment of splitCommand(command)) {
-    const words = stripPrefixes(segment)
+  return findPrCreate(splitCommand(command), [])
+}
+
+// 区切りを順にたどって gh pr create を探す。cds はそこまでに実行される cd
+function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undefined {
+  const cds = [...outerCds]
+  for (const segment of segments) {
+    // コマンド置換は区切りより先に、サブシェルで実行される。外の cd は引き継ぐが、中の cd は外に漏れない
+    for (const sub of segment.subs) {
+      const found = findPrCreate(sub, cds)
+      if (found !== undefined) return found
+    }
+    const words = stripPrefixes(segment.words)
     if (words[0] === 'cd') {
       if (words[1] !== '-') cds.push(words[1] ?? '')
       continue
@@ -321,13 +331,16 @@ function parseCreateArgs(args: string[]): { base?: string; head?: string; help: 
 }
 
 type Heredoc = { delim: string; strip: boolean }
+// コマンドの区切り 1 つ。subs は、その中の $(...) とバッククォートで実行されるコマンド(置換ごとに 1 つ)
+export type Segment = { words: string[]; subs: Segment[][] }
 
 // シェルのコマンドを、&& ; | ( ) 改行で区切られた単語の列に分ける。
 // 引用符は外して 1 つの単語にする。$(...) とバッククォートは中身ごと 1 つの単語の一部にしたうえで、
-// 中で実行されるコマンドも区切りとして加える。ヒアドキュメントの本文とコメントは読み飛ばす
-export function splitCommand(command: string): string[][] {
-  const segments: string[][] = []
+// 中で実行されるコマンドも、その区切りの subs として解析する。ヒアドキュメントの本文とコメントは読み飛ばす
+export function splitCommand(command: string): Segment[] {
+  const segments: Segment[] = []
   let words: string[] = []
+  let subs: Segment[][] = []
   let word = ''
   let inWord = false
   const heredocs: Heredoc[] = []
@@ -339,8 +352,9 @@ export function splitCommand(command: string): string[][] {
   }
   const endSegment = () => {
     endWord()
-    if (words.length > 0) segments.push(words)
+    if (words.length > 0 || subs.length > 0) segments.push({ words, subs })
     words = []
+    subs = []
   }
 
   let i = 0
@@ -353,19 +367,19 @@ export function splitCommand(command: string): string[][] {
       inWord = true
       i = end + 1
     } else if (c === '"') {
-      const r = scanDouble(command, i, segments)
+      const r = scanDouble(command, i, subs)
       word += r.text
       inWord = true
       i = r.end
     } else if (c === '$' && command[i + 1] === '(') {
       const end = scanSubst(command, i + 2)
-      segments.push(...splitCommand(substBody(command, i + 2, end)))
+      subs.push(splitCommand(substBody(command, i + 2, end)))
       word += command.slice(i, end)
       inWord = true
       i = end
     } else if (c === '`') {
       const end = scanBacktick(command, i)
-      segments.push(...splitCommand(substBody(command, i + 1, end, '`')))
+      subs.push(splitCommand(substBody(command, i + 1, end, '`')))
       word += command.slice(i, end)
       inWord = true
       i = end
@@ -403,8 +417,8 @@ export function splitCommand(command: string): string[][] {
 }
 
 // i は開きの " の位置。閉じの " の次の位置と、中身を返す。中の $(...) とバッククォートは入れ子として読み、
-// nested があれば、その中で実行されるコマンドの区切りを加える
-function scanDouble(s: string, i: number, nested?: string[][]): { end: number; text: string } {
+// subs があれば、その中で実行されるコマンドの解析結果を加える
+function scanDouble(s: string, i: number, subs?: Segment[][]): { end: number; text: string } {
   let text = ''
   let j = i + 1
   while (j < s.length && s[j] !== '"') {
@@ -414,12 +428,12 @@ function scanDouble(s: string, i: number, nested?: string[][]): { end: number; t
       j += 2
     } else if (c === '$' && s[j + 1] === '(') {
       const end = scanSubst(s, j + 2)
-      nested?.push(...splitCommand(substBody(s, j + 2, end)))
+      subs?.push(splitCommand(substBody(s, j + 2, end)))
       text += s.slice(j, end)
       j = end
     } else if (c === '`') {
       const end = scanBacktick(s, j)
-      nested?.push(...splitCommand(substBody(s, j + 1, end, '`')))
+      subs?.push(splitCommand(substBody(s, j + 1, end, '`')))
       text += s.slice(j, end)
       j = end
     } else {

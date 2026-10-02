@@ -2,6 +2,9 @@ import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import { parseJson, parsePrCreate, splitCommand } from '../hooks/register.ts'
 
+// 区切りごとの単語だけを取り出す(置換の中は含めない)
+const wordsOf = (command: string) => splitCommand(command).map(s => s.words)
+
 const ROOT = '/repo'
 const HEAD = 'abc123'
 const FEATURE_HEAD = 'f00d42'
@@ -212,6 +215,16 @@ describe('parsePrCreate', () => {
     expect(parsePrCreate('gh pr view "$(gh pr create --fill)" --web')).toEqual({ cds: [], base: undefined, head: undefined })
   })
 
+  test('does not let a cd inside $(...) or backticks move the outer gh pr create', async () => {
+    expect(parsePrCreate('OTHER=$(cd ../other-repo && git rev-parse HEAD) && gh pr create --fill')).toEqual({ cds: [], base: undefined, head: undefined })
+    expect(parsePrCreate('gh pr create --fill --body "$(cd ../notes && cat pr.md)"')).toEqual({ cds: [], base: undefined, head: undefined })
+    expect(parsePrCreate('x=`cd ../a`; cd b && gh pr create')).toEqual({ cds: ['b'], base: undefined, head: undefined })
+  })
+
+  test('applies outer and inner cd to gh pr create run inside $(...)', async () => {
+    expect(parsePrCreate('cd a && url=$(cd b && gh pr create --fill)')).toEqual({ cds: ['a', 'b'], base: undefined, head: undefined })
+  })
+
   test('does not find gh pr create in a heredoc body inside $(...)', async () => {
     expect(parsePrCreate(`echo --body "$(cat <<'EOF'\ngh pr create --base x\nEOF\n)"`)).toBe(undefined)
     expect(parsePrCreate(`gh pr view --body "$(cat <<'EOF'\ngh pr create --base x\nEOF\n)"`)).toBe(undefined)
@@ -239,11 +252,11 @@ describe('parsePrCreate', () => {
 
 describe('splitCommand', () => {
   test('splits on operators and keeps quoted text as one word', async () => {
-    expect(splitCommand(`a "b c" 'd' && e | f; g\nh # i`)).toEqual([['a', 'b c', 'd'], ['e'], ['f'], ['g'], ['h']])
+    expect(wordsOf(`a "b c" 'd' && e | f; g\nh # i`)).toEqual([['a', 'b c', 'd'], ['e'], ['f'], ['g'], ['h']])
   })
 
   test('skips heredoc bodies', async () => {
-    expect(splitCommand('cat <<-EOF > x\n\tgh pr create\n\tEOF\nnext')).toEqual([['cat', '>', 'x'], ['next']])
+    expect(wordsOf('cat <<-EOF > x\n\tgh pr create\n\tEOF\nnext')).toEqual([['cat', '>', 'x'], ['next']])
   })
 })
 

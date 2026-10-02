@@ -33,7 +33,7 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
   - `gh pr create --help` も判定しない
   - ユーザーが自分のターミナルで実行したコマンドや、GitHub の画面・MCP ツールで作る PR は対象外
 - **比べるのは、PR に入るコミット済みの内容。**
-  - 場所:コマンドの中に `cd` があれば、移った先のリポジトリ
+  - 場所:コマンドの中に `cd` があれば、移った先のリポジトリ(`$(...)` の中の `cd` はサブシェルで動くので、外側の `gh pr create` には効かない)
   - base ブランチ:`gh pr create` の `--base` / `-B` の指定があればそれを使う(`origin/<指定>` を優先)。なければ `origin` の既定ブランチ
   - head:`--head` / `-H` の指定があればそのブランチ(push 済みの `origin/<指定>` を優先)。なければ `HEAD`
   - 実装:`git diff <base>...<head>`
