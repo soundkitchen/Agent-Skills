@@ -111,6 +111,28 @@ describe('docs-sync', () => {
     expect(calls.models).toEqual([SESSION_MODEL])
   })
 
+  test('tells Claude that the check ran and found no mismatch', async ($, on) => {
+    world(on, { model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(r.deny).toBe(undefined)
+    expect(r.context?.length).toBe(1)
+    expect(r.context?.[0]).toContain('docs-sync: the documentation check ran')
+    expect(r.context?.[0]).toContain('against 1 of 1 documents and found no mismatch')
+  })
+
+  test('tells Claude when the commit already passed and was not checked again', async ($, on) => {
+    world(on, { model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(r.context?.[0]).toContain(`commit ${HEAD} already passed the check against origin/main`)
+  })
+
+  test('does not add a note to commands other than gh pr create', async ($, on) => {
+    world(on, { model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr view' })
+    expect(r.context).toBe(undefined)
+  })
+
   test('blocks gh pr create with the findings when the docs drift', async ($, on) => {
     const calls = world(on, { model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
@@ -147,9 +169,10 @@ describe('docs-sync', () => {
 
   test('passes without a model call when the branch has no diff', async ($, on) => {
     const calls = world(on, { diff: '', model: OK })
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran.length).toBe(1)
     expect(calls.model).toBe(0)
+    expect(r.context?.[0]).toContain('there is no diff between origin/main')
   })
 
   test('does not pass when no document is selected for a large repository', async ($, on) => {
@@ -175,8 +198,10 @@ describe('docs-sync', () => {
       const question = e.questions[0]!.question
       return { result: { questions: e.questions, answers: { [question]: 'このまま PR を作成する' } } }
     })
-    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual(['gh pr create --fill'])
+    expect(r.context?.[0]).toContain('could not run')
+    expect(r.context?.[0]).toContain('the user chose to create the PR anyway')
   })
 
   test('blocks when the check fails and the user cancels', async ($, on) => {
