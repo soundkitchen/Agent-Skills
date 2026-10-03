@@ -1,4 +1,4 @@
-import type { EngineInterface, Register } from 'claude-code'
+import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
 // 判定の上限。モデルは作業中のセッションと同じものを使う
 const MAX_TOKENS = 4096
@@ -12,7 +12,8 @@ const ASK_CONTINUE = 'このまま PR を作成する'
 const ASK_CANCEL = '中止する'
 
 type Finding = { doc: string; issue: string; fix: string }
-type Verdict = { status: 'ok' } | { status: 'drift'; findings: Finding[] }
+// ok の note は、通ったことと理由を Claude に伝える文
+type Verdict = { status: 'ok'; note: string } | { status: 'drift'; findings: Finding[] }
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
 export type PrCreate = { cds: string[]; base?: string; head?: string }
@@ -30,10 +31,11 @@ export const register: Register = on => {
       verdict = await check($, pr, next.signal)
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
-      return (await confirmAfterFailure($, reason)) ? next(e) : { deny: failureDeny(reason) }
+      if (!(await confirmAfterFailure($, reason))) return { deny: failureDeny(reason) }
+      return withNote(await next(e), failureNote(reason))
     }
 
-    if (verdict.status === 'ok') return next(e)
+    if (verdict.status === 'ok') return withNote(await next(e), verdict.note)
     return { deny: driftDeny(verdict.findings) }
   }).catch(async ($, e, next) => {
     // hook 自体が落ちたときは通さない側に倒す
@@ -55,29 +57,38 @@ async function check($: EngineInterface, pr: PrCreate, signal: AbortSignal): Pro
 
   // 同じ base で最後に通ったコミットと同じなら判定し直さない
   const cacheKey = `pass:${root}:${base}`
-  if ((await $.store.get(cacheKey)) === head) return { status: 'ok' }
+  const short = head.slice(0, 7)
+  if ((await $.store.get(cacheKey)) === head) {
+    return { status: 'ok', note: passNote(`commit ${short} already passed the check against ${base}, so it was not checked again`) }
+  }
 
   const diff = await git($, ['diff', '--no-color', `${base}...${head}`], root)
   if (diff === undefined) throw new CheckFailed(`git diff ${base}...${head} failed`)
-  if (diff.trim() === '') return { status: 'ok' }
+  if (diff.trim() === '') return { status: 'ok', note: passNote(`there is no diff between ${base} and ${short}, so there was nothing to check`) }
   if (diff.length > PROMPT_BUDGET) throw new CheckFailed('the diff is too large to check')
 
   const docs = await readDocs($, root, head)
-  if (docs.length === 0) return { status: 'ok' }
+  if (docs.length === 0) return { status: 'ok', note: passNote(`the repository has no Markdown documents at ${short}, so there was nothing to check`) }
 
   // 実装を読む判定なので、作業中のセッションと同じモデルで見る
   const model = await $.session.model()
   const changed = (await git($, ['diff', '--name-only', `${base}...${head}`], root)) ?? ''
   const selected = await selectDocs($, model, docs, diff, changed, signal)
-  const verdict = await judge($, model, selected, diff, signal)
+  const findings = await judge($, model, selected, diff, signal)
+  if (findings.length > 0) return { status: 'drift', findings }
 
-  if (verdict.status === 'ok') {
-    // 記録できなくても判定結果は変えない(次回また判定するだけ)
-    try {
-      await $.store.set(cacheKey, head)
-    } catch {}
-  }
-  return verdict
+  // 記録できなくても判定結果は変えない(次回また判定するだけ)
+  try {
+    await $.store.set(cacheKey, head)
+  } catch {}
+  const checked = `checked the diff ${base}...${short} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
+  return { status: 'ok', note: passNote(checked) }
+}
+
+// 通した gh pr create の結果に、Claude だけが読む一文を添える
+function withNote(r: ToolCallResult<'Bash'>, note: string): ToolCallResult<'Bash'> {
+  if (r.deny !== undefined) return r
+  return { ...r, context: [...(r.context ?? []), note] }
 }
 
 // git を cwd で実行し、成功したら stdout を返す
@@ -185,7 +196,8 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], diff: 
   return out
 }
 
-async function judge($: EngineInterface, model: string, docs: Doc[], diff: string, signal: AbortSignal): Promise<Verdict> {
+// ずれの指摘を返す。ずれがなければ空
+async function judge($: EngineInterface, model: string, docs: Doc[], diff: string, signal: AbortSignal): Promise<Finding[]> {
   const r = await $.model.complete(
     {
       model,
@@ -199,14 +211,13 @@ async function judge($: EngineInterface, model: string, docs: Doc[], diff: strin
   if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`)
 
   const v = parseJson(r.text) as { status?: unknown; findings?: unknown } | undefined
-  if (v?.status === 'ok') return { status: 'ok' }
+  if (v?.status === 'ok') return []
   if (v?.status === 'drift' && Array.isArray(v.findings) && v.findings.length > 0) {
-    const findings = v.findings.map(f => ({
+    return v.findings.map(f => ({
       doc: String(f?.doc ?? ''),
       issue: String(f?.issue ?? ''),
       fix: String(f?.fix ?? ''),
     }))
-    return { status: 'drift', findings }
   }
   throw new CheckFailed('could not read the model reply')
 }
@@ -554,6 +565,14 @@ export function driftDeny(findings: Finding[]): string {
     '3. If you think a finding is wrong, explain why to the user and ask how to proceed. Do not try to get around this check.',
     '4. Commit the fixes, push them, and run gh pr create again. docs-sync checks the new commit.',
   ].join('\n')
+}
+
+export function passNote(detail: string): string {
+  return `docs-sync: the documentation check ran before this gh pr create and let it through: ${detail}.`
+}
+
+export function failureNote(reason: string): string {
+  return `docs-sync: the documentation check could not run before this gh pr create (${reason}), and the user chose to create the PR anyway. The documentation was not verified against the implementation.`
 }
 
 export function failureDeny(reason: string): string {
