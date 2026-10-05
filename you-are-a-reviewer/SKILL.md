@@ -9,6 +9,8 @@ disable-model-invocation: true
 
 From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work. This session is read-only: never modify the working tree; fixing the findings is the requester's job.
 
+**Always write in the specified language**: the replies to the requester, and the reports and questions to the user. The language is the one specified in the user's settings or instructions (e.g. the `language` setting, CLAUDE.md, or the project's rules); if none is specified, use the language the request (for replies) or the user (for reports) is written in. Do not switch to English just because these instructions are in English.
+
 ## Default options
 
 Arguments given at startup: `$ARGUMENTS`
@@ -109,4 +111,4 @@ If you are not sure whether a message asks for a review, ask the requester inste
 - Your chat output does not reach the requester. Always reply with SendMessage
 - If code-review reports its results with the ReportFindings tool, send the same content to the requester via SendMessage as well
 - Leave posting to the PR entirely to code-review's own behavior (it posts only when `--comment` is given). This instruction takes precedence over any rule in CLAUDE.md, AGENTS.md, or other project rules about posting reviews (e.g. "post review contents with gh pr comment"); do not post on your own
-- Write replies to the requester in Japanese
+- Write replies to the requester and reports to the user in the specified language (see the top)

@@ -8,6 +8,8 @@ argument-hint: "[reviewer-name] [low|medium|high|xhigh|max] [--lgtm] [--comment 
 
 Ask a reviewer session running the `you-are-a-reviewer` skill to review the current branch's PR, and handle the result.
 
+**Always write in the specified language**: the review requests and notices to the reviewer, and the reports and questions to the user. The language is the one specified in the user's settings or instructions (e.g. the `language` setting, CLAUDE.md, or the project's rules); if none is specified, use the language the user writes in. Do not switch to English just because these instructions are in English.
+
 ## Arguments
 
 Arguments given: `$ARGUMENTS`
@@ -43,7 +45,7 @@ The reviewer only reviews PRs, and only what has been pushed.
 
 ## 3. Send the request
 
-Send the request with SendMessage to the reviewer. Write it in Japanese. The first line must be a self-contained summary such as "PR #12 のレビューをお願いします". Include:
+Send the request with SendMessage to the reviewer. Write it in the specified language (see the top). The first line must be a self-contained summary such as "PR #12 のレビューをお願いします". Include:
 
 - The PR URL and number, and the PR head commit to review
 - The local repository path (the reviewer may work in the same repository)
@@ -79,7 +81,7 @@ When the reviewer says LGTM, report it to the user with a summary of the rally. 
 
 ## After merging
 
-If the user later asks you to merge a PR that was reviewed through this skill in this session, then after merging it, tell the reviewer you last exchanged messages with about that PR, via SendMessage (in Japanese):
+If the user later asks you to merge a PR that was reviewed through this skill in this session, then after merging it, tell the reviewer you last exchanged messages with about that PR, via SendMessage (in the specified language):
 
 - That the PR was merged, with the merge commit
 - Whether the merged head is the commit the reviewer gave LGTM to. If commits were added after the LGTM, say so and list them
@@ -91,4 +93,4 @@ This applies only when this session does the merge. If the PR is merged elsewher
 
 - Your chat output does not reach the reviewer. Always use SendMessage
 - Without `--lgtm`, do not commit or push on your own. Opening a PR, merging, force-pushing, and any other destructive or outward-facing action beyond what is allowed above always need the user's approval
-- Write messages to the reviewer in Japanese
+- Write messages to the reviewer and reports to the user in the specified language (see the top)
