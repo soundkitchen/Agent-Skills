@@ -8,6 +8,8 @@ argument-hint: "[notes, e.g. what to keep running]"
 
 The user is about to close this session and continue in another one. Make sure nothing is left behind: clean up what is mechanical, ask about what needs judgment, and leave the remaining work where the next session (or a teammate) will find it.
 
+**Always write in the specified language**: the list and questions to the user, the final report, and the handoff content (Issues, PR comments, docs, TODO). The language is the one specified in the user's settings or instructions (e.g. the `language` setting, CLAUDE.md, or the project's rules); if none is specified, use the language the user writes in. Do not switch to English just because these instructions are in English.
+
 ## Arguments
 
 Arguments given: `$ARGUMENTS`
@@ -85,5 +87,5 @@ Do not end the session yourself. The user closes it.
 
 ## Notes
 
-- Write the report and questions in the language the user uses
+- Write the report, questions, and handoff content in the specified language (see the top)
 - Creating Issues, posting comments, committing, and pushing are outward-facing or hard to undo: do them only when approved in step 3
