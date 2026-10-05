@@ -18,15 +18,17 @@ Free-form notes from the user (e.g. "dev サーバーは残して", "docs は見
 
 Follow the project's rules (CLAUDE.md, AGENTS.md, docs): branch flow, commit message language, keeping docs in sync with code, where TODOs live, which language Issues and comments are written in. They take precedence over this skill.
 
-## 1. Collect loose ends (read-only)
+## 1. Collect loose ends
 
-Look at both the repository and this conversation. Skip a check if it does not apply (e.g. not a git repository, `gh` not available or not authenticated, no remote).
+Look at both the repository and this conversation. Do not change anything in this step, except updating remote-tracking branches with `git fetch --prune`. Skip a check if it does not apply (e.g. not a git repository, `gh` not available or not authenticated, no remote).
 
 **Repository**
 - Current branch, uncommitted changes and untracked files (`git status --porcelain`), stashes
 - Unpushed commits (compare with the upstream; a branch with no upstream counts as unpushed)
-- `git fetch --prune`, then: local branches already merged into the default branch or whose upstream is gone, and worktrees (`git worktree list`) whose branch is merged
+- `git fetch --prune`, then: merged local branches, and worktrees (`git worktree list`) whose branch is merged (see "Merged branches" below)
 - The current branch's PR and its state (`gh pr view`); other open PRs and Issues this session worked on
+
+**Merged branches**: a branch counts as merged only if its PR was merged (`gh pr list --state merged --head <branch>`), or its upstream is gone after `git fetch --prune`. Do not use `git branch --merged` alone: a branch just created from the default branch, with no commits yet, also appears there, and it may be another session's work that has just started. A branch that points at the same commit as the default branch (`origin/<default>`) and has no merged PR is not merged; report it instead.
 
 **This session**
 - Background processes this session started (dev servers, watchers, background shells, `Monitor`s) that are still running
@@ -38,12 +40,12 @@ Only consider things this session created or worked on, plus merged branches and
 
 ## 2. Clean up the mechanical ones (no confirmation)
 
-Do these without asking, unless the user's notes say otherwise:
+Do these without asking, unless the user's notes say otherwise, in this order:
 
-- Stop the background processes this session started
-- Delete local branches that are merged (`git branch -d`, never `-D`). Never delete the current branch, the default branch, or remote branches
-- Remove worktrees whose branch is merged and that have no uncommitted changes (`git worktree remove`, never `--force`)
-- If the current branch is merged and the working tree is clean, switch to the default branch and update it (`git pull --ff-only`), then delete the merged branch as above
+1. Stop the background processes this session started
+2. If the current branch is merged, the working tree is clean, and you are in the main worktree, switch to the default branch and update it (`git pull --ff-only`). Doing this first lets the branch deletions below succeed with `-d`
+3. Remove worktrees whose branch is merged and that have no uncommitted changes (`git worktree remove`, never `--force`). Never remove the main worktree or the worktree this session is working in (`git worktree remove` succeeds even when run from inside the worktree it removes); report those instead
+4. Delete merged local branches (`git branch -d`, never `-D`). Never delete the current branch, the default branch, a branch still checked out in a worktree, or remote branches
 
 If any of these fails or looks unsafe (e.g. unmerged commits, uncommitted changes), stop that item and report it instead.
 
