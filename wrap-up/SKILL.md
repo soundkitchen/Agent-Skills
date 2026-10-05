@@ -1,6 +1,6 @@
 ---
 name: wrap-up
-description: Wrap up the current session (thread) before the user closes it - find loose ends (uncommitted or unpushed work, stale docs, servers left running, merged branches and worktrees), clean up the mechanical ones, and hand off what remains to where it belongs (Issues, PR comments, docs, TODO). Use when the user is about to end the thread, e.g. "ここで区切りましょう", "このスレッドはここまでにしよう", "閉じる前にやっておくべきことはありますか？", "やり残した作業はありますか？", "別スレッドに移る前に片付けて". Not for ending a single task in the middle of a thread.
+description: Wrap up the current session (thread) before the user closes it - find loose ends (uncommitted or unpushed work, stale docs, servers left running, merged branches and worktrees), clean up the mechanical ones, and hand off what remains to where it belongs (Issues, PR comments, docs, TODO). Use when the user is about to end the thread, e.g. "ここで区切りましょう", "一旦ここで区切ります", "ここで終わります", "今日はここまでにしましょう", "今日の作業は完了です", "このスレッドはここまでにしよう", "閉じる前にやっておくべきことはありますか？", "やり残した作業はありますか？", "別スレッドに移る前に片付けて", even when followed by "お疲れ様でした". Not for ending a single task in the middle of a thread.
 argument-hint: "[notes, e.g. what to keep running]"
 ---
 
