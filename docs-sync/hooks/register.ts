@@ -12,12 +12,14 @@ const ASK_CANCEL = '中止する'
 
 type Finding = { doc: string; issue: string; fix: string }
 // ok の detail は、通した理由を Claude に伝える文
-type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: Finding[] }
+// split は、同じコマンドの中の mover のために判定できないので、分けて実行させる
+type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: Finding[] } | { status: 'split'; mover: string }
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
-export type PrCreate = { cds: string[]; base?: string; head?: string }
+// mover は、同じコマンドの中で先に実行される、コミットを作る・動かす git コマンド(`git commit` など)
+export type PrCreate = { cds: string[]; base?: string; head?: string; mover?: string }
 // コマンドから読み取った git push の内容。remote は push 先の指定(省略時は git の既定)、refs が空なら今のブランチを push する
-export type Push = { cds: string[]; remote?: string; refs: PushRef[] }
+export type Push = { cds: string[]; remote?: string; refs: PushRef[]; mover?: string }
 // push する refspec。src は push するコミット、dst は push 先のブランチ(省略時は src と同じ)
 export type PushRef = { src: string; dst?: string }
 
@@ -61,6 +63,7 @@ export const register: Register = on => {
     // 開いている PR がないブランチへの push は、判定しない(PR を作るときに判定する)
     if (verdict === undefined) return next(e)
     if (verdict.status === 'ok') return withNote(await next(e), passNote(action, verdict.detail))
+    if (verdict.status === 'split') return { deny: splitDeny(action, verdict.mover) }
     return { deny: driftDeny(action, verdict.findings) }
   }).catch(async ($, e, next) => {
     // hook 自体が落ちたときは通さない側に倒す
@@ -79,6 +82,7 @@ function actionOf(command: string): Action {
 
 // gh pr create で作る PR の内容(base...head の差分)とドキュメントを比べる
 async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSignal): Promise<Verdict> {
+  if (pr.mover !== undefined) return { status: 'split', mover: pr.mover }
   const root = await resolveRoot($, pr.cds)
   const head = await resolveHead($, root, pr.head)
   if (head === undefined) throw new CheckFailed(`could not resolve the head ${pr.head ?? 'HEAD'}`)
@@ -106,17 +110,19 @@ async function checkPush($: EngineInterface, push: Push, signal: AbortSignal): P
   const prs = await openPrs($, root)
   if (prs === undefined) return undefined
 
+  const targets = refs.flatMap(ref => prs.filter(p => p.repo === remote.repo && p.head === ref.dst).map(pr => ({ ref, pr })))
+  // 開いている PR を更新する push の前にコミットを作る・動かすなら、push するコミットがまだわからない
+  if (targets.length > 0 && push.mover !== undefined) return { status: 'split', mover: push.mover }
+
   const details: string[] = []
-  for (const ref of refs) {
-    for (const pr of prs.filter(p => p.repo === remote.repo && p.head === ref.dst)) {
-      const head = await firstCommit($, root, [ref.src])
-      if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
-      const base = await resolveBase($, root, pr.base)
-      if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base} of PR #${pr.number}`)
-      const v = await check($, root, base, head, signal)
-      if (v.status === 'drift') return v
-      details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
-    }
+  for (const { ref, pr } of targets) {
+    const head = await firstCommit($, root, [ref.src])
+    if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
+    const base = await resolveBase($, root, pr.base)
+    if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base} of PR #${pr.number}`)
+    const v = await check($, root, base, head, signal)
+    if (v.status !== 'ok') return v
+    details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
   }
   return details.length > 0 ? { status: 'ok', detail: details.join('; ') } : undefined
 }
@@ -410,50 +416,73 @@ export function parsePrCreate(command: string): PrCreate | undefined {
 
 // 区切りを順にたどって gh pr create を探す。cds はそこまでに実行される cd
 function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undefined {
-  return findCommand(segments, outerCds, (words, cds) => {
+  return findCommand(segments, outerCds, (words, cds, mover) => {
     if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'create') return undefined
     const args = parseCreateArgs(words.slice(3))
     if (args.help) return null
-    return { cds, base: args.base, head: args.head }
+    const pr: PrCreate = { cds, base: args.base, head: args.head }
+    return mover === undefined ? pr : { ...pr, mover }
   })
 }
 
 // コマンドが git push を実行するなら、その内容を返す。ブランチの削除・dry run・タグだけの push などは対象外
 export function parsePush(command: string): Push | undefined {
-  return findCommand(splitCommand(command), [], (words, cds) => {
-    if (words[0] !== 'git') return undefined
-    // git の全体のオプション。-C と --work-tree は cd と同じく場所を変える。
-    // --git-dir は、.git を指すならその親へ移る。それ以外(bare リポジトリなど)は判定しない
-    const here = [...cds]
-    let i = 1
-    while (i < words.length && words[i]!.startsWith('-')) {
-      const w = words[i]!
-      const eq = w.startsWith('--') ? w.indexOf('=') : -1
-      const name = eq < 0 ? w : w.slice(0, eq)
-      const takesValue = GIT_VALUE_OPTIONS.has(name)
-      const value = !takesValue ? undefined : eq < 0 ? words[i + 1] : w.slice(eq + 1)
-      if (name === '-C' || name === '--work-tree') here.push(value ?? '')
-      if (name === '--git-dir') {
-        const dir = (value ?? '').replace(/\/+$/, '')
-        if (dir !== '.git' && !dir.endsWith('/.git')) return null
-        if (dir !== '.git') here.push(dir.slice(0, -'/.git'.length) || '/')
-      }
-      i += takesValue && eq < 0 ? 2 : 1
-    }
-    if (words[i] !== 'push') return undefined
-    const args = parsePushArgs(words.slice(i + 1))
-    return args === undefined ? null : { cds: here, ...args }
+  return findCommand(splitCommand(command), [], (words, cds, mover) => {
+    const g = parseGit(words, cds)
+    if (g === undefined || g.sub !== 'push') return undefined
+    // bare リポジトリなど、場所を読み取れない git push は判定しない
+    if (g.here === undefined) return null
+    const args = parsePushArgs(g.rest)
+    if (args === undefined) return null
+    return mover === undefined ? { cds: g.here, ...args } : { cds: g.here, ...args, mover }
   })
 }
 
+// git のコマンドなら、サブコマンドとその引数、実行される場所(cds に全体のオプションの分を足したもの)を返す。
+// -C と --work-tree は cd と同じく場所を変える。--git-dir は、.git を指すならその親へ移り、
+// それ以外(bare リポジトリなど)は場所を読み取れないので here を undefined にする
+function parseGit(words: string[], cds: string[]): { sub: string; rest: string[]; here?: string[] } | undefined {
+  if (words[0] !== 'git') return undefined
+  let here: string[] | undefined = [...cds]
+  let i = 1
+  while (i < words.length && words[i]!.startsWith('-')) {
+    const w = words[i]!
+    const eq = w.startsWith('--') ? w.indexOf('=') : -1
+    const name = eq < 0 ? w : w.slice(0, eq)
+    const takesValue = GIT_VALUE_OPTIONS.has(name)
+    const value = !takesValue ? undefined : eq < 0 ? words[i + 1] : w.slice(eq + 1)
+    if (name === '-C' || name === '--work-tree') here?.push(value ?? '')
+    if (name === '--git-dir') {
+      const dir = (value ?? '').replace(/\/+$/, '')
+      if (dir !== '.git' && !dir.endsWith('/.git')) here = undefined
+      else if (dir !== '.git') here?.push(dir.slice(0, -'/.git'.length) || '/')
+    }
+    i += takesValue && eq < 0 ? 2 : 1
+  }
+  const sub = words[i]
+  if (sub === undefined) return undefined
+  return here === undefined ? { sub, rest: words.slice(i + 1) } : { sub, rest: words.slice(i + 1), here }
+}
+
+// コミットを作る、またはブランチの指すコミットを動かす git のサブコマンド。
+// これが push や gh pr create より前にあると、実行する前の今は、push・PR に入るコミットがまだわからない
+const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'pull', 'reset', 'checkout', 'switch'])
+
 // 区切りを順にたどり、match が値を返した最初のコマンドを返す。match は、対象外なら undefined、
-// 見つけたが判定しないなら null を返す(後ろのコマンドは続けて探す)。cds はそこまでに実行される cd
-function findCommand<T>(segments: Segment[], outerCds: string[], match: (words: string[], cds: string[]) => T | null | undefined): T | undefined {
+// 見つけたが判定しないなら null を返す(後ろのコマンドは続けて探す)。cds はそこまでに実行される cd、
+// mover はそこまでに実行される、コミットを作る・動かす git コマンド(最初のもの)
+function findCommand<T>(
+  segments: Segment[],
+  outerCds: string[],
+  match: (words: string[], cds: string[], mover: string | undefined) => T | null | undefined,
+  outerMover?: string,
+): T | undefined {
   const cds = [...outerCds]
+  let mover = outerMover
   for (const segment of segments) {
     // コマンド置換は区切りより先に、サブシェルで実行される。外の cd は引き継ぐが、中の cd は外に漏れない
     for (const sub of segment.subs) {
-      const found = findCommand(sub, cds, match)
+      const found = findCommand(sub, cds, match, mover)
       if (found !== undefined) return found
     }
     const words = stripPrefixes(segment.words)
@@ -461,8 +490,10 @@ function findCommand<T>(segments: Segment[], outerCds: string[], match: (words: 
       if (words[1] !== '-') cds.push(words[1] ?? '')
       continue
     }
-    const found = match(words, [...cds])
+    const found = match(words, [...cds], mover)
     if (found !== undefined && found !== null) return found
+    const g = parseGit(words, cds)
+    if (mover === undefined && g !== undefined && HEAD_MOVERS.has(g.sub)) mover = `git ${g.sub}`
   }
   return undefined
 }
@@ -820,6 +851,13 @@ export function driftDeny(action: Action, findings: Finding[]): string {
     '2. If the project treats its docs as the spec (e.g. CLAUDE.md says so) and the implementation deviates from that spec, do not edit either side yet: ask the user which one to change.',
     '3. If you think a finding is wrong, explain why to the user and ask how to proceed. Do not try to get around this check.',
     `4. ${action.retry} docs-sync checks the new commit.`,
+  ].join('\n')
+}
+
+export function splitDeny(action: Action, mover: string): string {
+  return [
+    `docs-sync: ${action.blocked} because this command runs ${mover} before ${action.command}. docs-sync checks before the command runs, so it cannot see the commits that ${mover} will make or move.`,
+    `Run the part up to ${mover} as its own command first, then run ${action.command} as a separate command so that docs-sync can check the commits it sends. Do not try to get around this check.`,
   ].join('\n')
 }
 

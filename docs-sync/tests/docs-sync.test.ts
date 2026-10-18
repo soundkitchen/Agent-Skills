@@ -174,9 +174,9 @@ describe('docs-sync', () => {
     expect(calls.model).toBe(2)
   })
 
-  test('does not take git checkout -B as the base branch', async ($, on) => {
+  test('does not take -B of another command as the base branch', async ($, on) => {
     const calls = world(on, { model: DRIFT })
-    const r = await $.tool.call({ tool: 'Bash', command: 'git checkout -B fix/foo && git push -u origin fix/foo && gh pr create --fill' })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git diff -B --stat && git push -u origin fix/foo && gh pr create --fill' })
     expect(r.deny).toContain('README.md')
     expect(calls.git).toContain(`diff --no-color origin/main...${HEAD}`)
   })
@@ -343,6 +343,37 @@ describe('docs-sync on git push', () => {
     expect(calls.model).toBe(0)
   })
 
+  test('asks Claude to split the command when it commits before pushing to a branch with an open PR', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m fix && git push' })
+    expect(r.deny).toContain('the push was blocked because this command runs git commit before git push')
+    expect(r.deny).toContain('run git push as a separate command')
+    expect(calls.model).toBe(0)
+    expect(calls.ran).toEqual([])
+  })
+
+  test('lets a commit and a push in one command run when the branch has no open PR', async ($, on) => {
+    const calls = world(on, { prs: [], model: DRIFT })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m fix && git push -u origin fix/foo' })
+    expect(r.deny).toBe(undefined)
+    expect(calls.ran.length).toBe(1)
+  })
+
+  test('asks Claude to split the command when it commits before gh pr create', async ($, on) => {
+    const calls = world(on, { model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m fix && git push -u origin fix/foo && gh pr create --fill' })
+    expect(r.deny).toContain('PR creation was blocked because this command runs git commit before gh pr create')
+    expect(calls.git).toEqual([])
+    expect(calls.ran).toEqual([])
+  })
+
+  test('does not count git commands that run after the push', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push && git checkout main' })
+    expect(r.deny).toBe(undefined)
+    expect(calls.model).toBe(1)
+  })
+
   test('checks a push that comes after a push it does not check', async ($, on) => {
     const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push origin --delete old && git push origin fix/foo' })
@@ -356,7 +387,7 @@ describe('parsePrCreate', () => {
     expect(parsePrCreate('gh pr create --base develop --fill')).toEqual({ cds: [], base: 'develop', head: undefined })
     expect(parsePrCreate('gh pr create --base=release/1.0 -H feat')).toEqual({ cds: [], base: 'release/1.0', head: 'feat' })
     expect(parsePrCreate("gh pr create -B 'main'")).toEqual({ cds: [], base: 'main', head: undefined })
-    expect(parsePrCreate('git checkout -B x && gh pr create --body "use --base y"')).toEqual({ cds: [], base: undefined, head: undefined })
+    expect(parsePrCreate('git checkout -B x && gh pr create --body "use --base y"')).toEqual({ cds: [], base: undefined, head: undefined, mover: 'git checkout' })
     expect(parsePrCreate('cd a && cd b; GH_HOST=x gh pr create')).toEqual({ cds: ['a', 'b'], base: undefined, head: undefined })
   })
 
@@ -432,6 +463,12 @@ describe('parsePush', () => {
     for (const command of ['git push --delete origin x', 'git push -d origin x', 'git push --dry-run', 'git push -n', 'git push --tags', 'git push --all', 'git push --mirror', 'git push -h']) {
       expect(parsePush(command)).toBe(undefined)
     }
+  })
+
+  test('records a git command that makes or moves commits before the push', async () => {
+    expect(parsePush('git commit -m "x" && git -C . push')?.mover).toBe('git commit')
+    expect(parsePush('git fetch && git status && git push')?.mover).toBe(undefined)
+    expect(parsePush('git push && git commit -m x')?.mover).toBe(undefined)
   })
 
   test('ignores git push inside quotes and other git commands', async () => {
