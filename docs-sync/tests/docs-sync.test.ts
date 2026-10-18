@@ -11,14 +11,17 @@ const FEATURE_HEAD = 'f00d42'
 const SESSION_MODEL = 'claude-opus-5-5'
 
 type Model = (prompt: string) => { text: string } | { reason: 'empty-reply' }
-// PR の head のリポジトリは、owner を省略すると origin と同じ o/r
+// PR の head のリポジトリは、owner を省略すると o/r。PR を出した先のリポジトリは o/r
 type Pr = { number: number; state: string; baseRefName: string; headRefName: string; owner?: string }
+// fork の構成。origin が自分の fork(me/r)、upstream が元のリポジトリ(o/r)
+const FORK_REMOTES = { origin: 'git@github.com:me/r.git', upstream: 'https://github.com/o/r.git' }
 const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName: 'fix/foo' }
 
 // git・gh と model を差し替え、Bash の実行は「走った」ことだけを記録する。
-// 今のブランチは fix/foo(upstream は origin/fix/foo)。remote は origin(o/r)と fork(me/r)。
-// prs は GitHub にある PR で、gh pr list --state open は開いているものだけを返す
-function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string, string>; prs?: Pr[]; model: Model }) {
+// 今のブランチは fix/foo(upstream は origin/fix/foo)。remote は、remotes を省略すると origin(o/r)と fork(me/r)。
+// prs は GitHub にある PR で、gh pr list --state open は開いているものだけを返す。gh repo view は o/r(既定のブランチは main)
+function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string, string>; prs?: Pr[]; remotes?: Record<string, string>; model: Model }) {
+  const remotes = opts.remotes ?? { origin: 'git@github.com:o/r.git', fork: 'https://github.com/me/r.git' }
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
   const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[] }
 
@@ -32,9 +35,11 @@ function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string
     const fail = { value: { exitCode: 1, stdout: '', stderr: 'no', isStdoutTruncated: false, isStderrTruncated: false } }
     if (cmd === 'gh') {
       calls.gh.push(args.join(' '))
+      if (args[0] === 'repo' && args[1] === 'view') return ok(JSON.stringify({ nameWithOwner: 'o/r', defaultBranchRef: { name: 'main' } }))
       if (args[0] !== 'pr' || args[1] !== 'list') return fail
       const open = (opts.prs ?? []).filter(pr => pr.state === 'OPEN').map(pr => ({
         number: pr.number,
+        url: `https://github.com/o/r/pull/${pr.number}`,
         baseRefName: pr.baseRefName,
         headRefName: pr.headRefName,
         headRepository: { name: 'r' },
@@ -55,16 +60,18 @@ function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string
     if (sub === 'symbolic-ref --short --quiet HEAD') return ok('fix/foo\n')
     if (sub === 'config branch.fix/foo.remote') return ok('origin\n')
     if (sub === 'config branch.fix/foo.merge') return ok('refs/heads/fix/foo\n')
-    if (sub === 'remote get-url --push origin') return ok('git@github.com:o/r.git\n')
-    if (sub === 'remote get-url --push fork') return ok('https://github.com/me/r.git\n')
+    if (sub === 'remote') return ok(Object.keys(remotes).join('\n') + '\n')
+    const url = /^remote get-url (?:--push )?(\S+)$/.exec(sub)
+    if (url !== null) return url[1]! in remotes ? ok(`${remotes[url[1]!]}\n`) : fail
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return ok(`${HEAD}\n`)
     if (sub === 'rev-parse --verify --quiet fix/foo^{commit}') return ok(`${HEAD}\n`)
     if (sub === 'symbolic-ref --short refs/remotes/origin/HEAD') return ok('origin/main\n')
     if (sub === 'rev-parse --verify --quiet origin/main^{commit}') return ok('deadbeef\n')
+    if (sub === 'rev-parse --verify --quiet upstream/main^{commit}' && 'upstream' in remotes) return ok('cafe00\n')
     if (sub === 'rev-parse --verify --quiet origin/feature/x^{commit}') return ok(`${FEATURE_HEAD}\n`)
     if (sub.startsWith('rev-parse --verify --quiet')) return fail
-    if (/^diff --no-color origin\/main\.\.\.\w+$/.test(sub)) return ok(opts.diff ?? '+ renamed --fast to --quick\n')
-    if (/^diff --name-only origin\/main\.\.\.\w+$/.test(sub)) return ok('src/cli.ts\n')
+    if (/^diff --no-color (origin|upstream)\/main\.\.\.\w+$/.test(sub)) return ok(opts.diff ?? '+ renamed --fast to --quick\n')
+    if (/^diff --name-only (origin|upstream)\/main\.\.\.\w+$/.test(sub)) return ok('src/cli.ts\n')
     if (sub.startsWith('ls-tree -r --name-only')) return ok([...Object.keys(docs), 'src/cli.ts'].join('\n') + '\n')
     if (args[0] === 'show') {
       const path = args[1]!.replace(/^\w+:/, '')
@@ -213,6 +220,19 @@ describe('docs-sync', () => {
     expect(calls.cwds).toEqual(['C:/Users/me/repo'])
   })
 
+  test('takes the base from the remote of the repository the PR goes to, such as upstream in a fork', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.git).toContain(`diff --no-color upstream/main...${HEAD}`)
+  })
+
+  test('passes -R to gh repo view to find the repository the PR goes to', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create -R o/r --base main --fill' })
+    expect(calls.gh).toEqual(['repo view o/r --json nameWithOwner,defaultBranchRef'])
+    expect(calls.git).toContain(`diff --no-color upstream/main...${HEAD}`)
+  })
+
   test('checks the branch given with --head instead of HEAD', async ($, on) => {
     const calls = world(on, { model: OK })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --head feature/x --fill' })
@@ -275,7 +295,7 @@ describe('docs-sync on git push', () => {
     expect(r.deny).toContain('docs-sync: the push was blocked')
     expect(r.deny).toContain('README.md: says --fast but the CLI now takes --quick')
     expect(r.deny).toContain('Commit the fixes and push again')
-    expect(calls.gh).toEqual(['pr list --state open --limit 1000 --json number,baseRefName,headRefName,headRepository,headRepositoryOwner'])
+    expect(calls.gh).toEqual(['pr list --state open --limit 1000 --json number,url,baseRefName,headRefName,headRepository,headRepositoryOwner'])
     expect(calls.git).toContain(`diff --no-color origin/main...${HEAD}`)
     expect(calls.ran).toEqual([])
   })
@@ -310,6 +330,13 @@ describe('docs-sync on git push', () => {
     expect(calls.ran).toEqual([])
   })
 
+  test('checks a push to a fork against the base in the repository the PR goes to', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, prs: [{ ...OPEN_PR, owner: 'me' }], model: DRIFT })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push origin fix/foo' })
+    expect(r.deny).toContain('the push was blocked')
+    expect(calls.git).toContain(`diff --no-color upstream/main...${HEAD}`)
+  })
+
   test('does not check the push again for a commit that passed with gh pr create', async ($, on) => {
     const calls = world(on, { prs: [OPEN_PR], model: OK })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
@@ -321,7 +348,7 @@ describe('docs-sync on git push', () => {
   test('checks a push in the same command as gh pr create only once, as gh pr create', async ($, on) => {
     const calls = world(on, { prs: [OPEN_PR], model: OK })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push -u origin fix/foo && gh pr create --fill' })
-    expect(calls.gh).toEqual([])
+    expect(calls.gh).toEqual(['repo view --json nameWithOwner,defaultBranchRef'])
     expect(calls.model).toBe(1)
     expect(r.context?.[0]).toContain('before this gh pr create')
   })
