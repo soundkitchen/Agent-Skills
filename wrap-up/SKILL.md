@@ -81,7 +81,7 @@ Report briefly:
 - What was cleaned up automatically in step 2
 - What was done in step 4, with links (Issues, PR comments, commits)
 - What was left as is, and anything you could not check
-- Where the next session should start (e.g. "次は #12 から。続きは PR #34 のコメント参照"), pointing to where the handoff was written
+- Where the next session should start (e.g. "Start from #12; see the comment on PR #34 for where things stand", in the specified language), pointing to where the handoff was written
 
 Do not end the session yourself. The user closes it.
 
