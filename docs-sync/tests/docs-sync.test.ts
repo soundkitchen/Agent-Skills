@@ -168,6 +168,25 @@ describe('docs-sync', () => {
     expect(calls.ran).toHaveLength(1)
   })
 
+  test('follows a chain of cd on Windows, decided by the session cwd', async ($, on) => {
+    const calls = world(on, { cwd: 'D:\\works\\a', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'cd /usr/local && cd D:/repo && cd sub && gh pr create --fill' })
+    expect(calls.cwds).toEqual(['D:/repo/sub'])
+  })
+
+  test('turns a Git Bash /d/... path after cd into a drive path', async ($, on) => {
+    const calls = world(on, { cwd: 'C:\\Users\\me', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'cd /d/works/repo && gh pr create --fill' })
+    expect(calls.cwds).toEqual(['D:/works/repo'])
+  })
+
+  test('resolves cd ~ on Windows with HOME', async ($, on) => {
+    const calls = world(on, { cwd: 'D:\\works\\a', model: OK })
+    mock.env(on, { HOME: 'C:\\Users\\me' })
+    await $.tool.call({ tool: 'Bash', command: 'cd ~/repo && gh pr create --fill' })
+    expect(calls.cwds).toEqual(['C:/Users/me/repo'])
+  })
+
   test('checks the branch given with --head instead of HEAD', async ($, on) => {
     const calls = world(on, { model: OK })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --head feature/x --fill' })
@@ -294,20 +313,25 @@ describe('splitCommand', () => {
 
 describe('joinDir', () => {
   test('joins a relative path and keeps a POSIX absolute path', async () => {
-    expect(joinDir('/repo', '../other')).toBe('/repo/../other')
-    expect(joinDir('/repo', '/d/works')).toBe('/d/works')
+    expect(joinDir('/repo', '../other', false)).toBe('/repo/../other')
+    expect(joinDir('/repo', '/d/works', false)).toBe('/d/works')
+    expect(joinDir('/repo', 'D:', false)).toBe('/repo/D:')
   })
 
-  test('treats drive paths as absolute when the session runs on Windows', async () => {
-    expect(joinDir('D:\\works\\a', 'E:/b')).toBe('E:/b')
-    expect(joinDir('D:\\works\\a', 'E:\\b')).toBe('E:\\b')
-    expect(joinDir('D:\\works\\a', 'sub')).toBe('D:\\works\\a/sub')
+  test('treats drive paths as absolute on Windows, with / as the separator', async () => {
+    expect(joinDir('D:\\works\\a', 'E:/b', true)).toBe('E:/b')
+    expect(joinDir('D:\\works\\a', 'E:\\b', true)).toBe('E:/b')
+    expect(joinDir('D:\\works\\a', 'E:', true)).toBe('E:/')
+    expect(joinDir('D:\\works\\a', 'E:b', true)).toBe('E:b')
+    expect(joinDir('D:\\works\\a', 'sub', true)).toBe('D:/works/a/sub')
+    expect(joinDir('D:\\', 'sub', true)).toBe('D:/sub')
   })
 
-  test('turns a Git Bash /d/... path into a drive path on Windows', async () => {
-    expect(joinDir('C:\\Users\\me', '/d/works/a')).toBe('D:/works/a')
-    expect(joinDir('C:\\Users\\me', '/d')).toBe('D:/')
-    expect(joinDir('C:\\Users\\me', '/usr/bin')).toBe('/usr/bin')
+  test('turns Git Bash /d/... and Cygwin /cygdrive/d/... into drive paths on Windows', async () => {
+    expect(joinDir('C:\\Users\\me', '/d/works/a', true)).toBe('D:/works/a')
+    expect(joinDir('C:\\Users\\me', '/d', true)).toBe('D:/')
+    expect(joinDir('C:\\Users\\me', '/cygdrive/d/works/a', true)).toBe('D:/works/a')
+    expect(joinDir('C:\\Users\\me', '/usr/bin', true)).toBe('/usr/bin')
   })
 })
 

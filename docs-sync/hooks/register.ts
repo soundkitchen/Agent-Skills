@@ -105,6 +105,8 @@ async function git($: EngineInterface, args: string[], cwd: string): Promise<str
 // コマンド内の cd を順にたどり、gh pr create が実行される場所を求める
 async function resolveCwd($: EngineInterface, cds: string[]): Promise<string> {
   let cwd = await $.session.cwd()
+  // Windows かどうかは、cd で移る前のセッションの cwd で一度だけ決める
+  const windows = DRIVE.test(cwd)
   for (const dir of cds) {
     let target = dir
     if (target === '' || target === '~' || target.startsWith('~/')) {
@@ -112,23 +114,25 @@ async function resolveCwd($: EngineInterface, cds: string[]): Promise<string> {
       if (home === undefined) throw new CheckFailed('could not resolve ~ in cd')
       target = home + target.slice(1)
     }
-    cwd = joinDir(cwd, target)
+    cwd = joinDir(cwd, target, windows)
   }
   return cwd
 }
 
-// Windows のドライブ文字付きの絶対パス(D:/ や D:\)
-const DRIVE_PATH = /^[A-Za-z]:[\\/]/
+// Windows のドライブ文字で始まるパス(D:、D:/、D:\、D:repo)
+const DRIVE = /^[A-Za-z]:/
 
-// cd の行き先を、今いる場所から求める。cwd がドライブ文字で始まるとき(Windows)は、
-// D:/ や D:\ を絶対パスとして扱い、Git Bash の /d/... は git が解決できる D:/... に直す
-export function joinDir(cwd: string, target: string): string {
-  if (DRIVE_PATH.test(cwd)) {
-    if (DRIVE_PATH.test(target)) return target
-    const mount = /^\/([A-Za-z])(\/.*)?$/.exec(target)
-    if (mount !== null) return `${mount[1]!.toUpperCase()}:${mount[2] ?? '/'}`
-  }
-  return target.startsWith('/') ? target : `${cwd}/${target}`
+// cd の行き先を、今いる場所から求める。Windows では、区切り文字を / にそろえ、
+// ドライブ文字で始まるパスを絶対パスとして扱う。Git Bash・MSYS2 の /d/... と Cygwin の /cygdrive/d/... は、
+// git が解決できる D:/... に直す
+export function joinDir(cwd: string, target: string, windows: boolean): string {
+  if (!windows) return target.startsWith('/') ? target : `${cwd}/${target}`
+  const t = target.replace(/\\/g, '/')
+  const mount = /^(?:\/cygdrive)?\/([A-Za-z])(\/.*)?$/.exec(t)
+  if (mount !== null) return `${mount[1]!.toUpperCase()}:${mount[2] ?? '/'}`
+  if (DRIVE.test(t)) return t.length === 2 ? `${t}/` : t
+  if (t.startsWith('/')) return t
+  return `${cwd.replace(/\\/g, '/').replace(/\/$/, '')}/${t}`
 }
 
 // PR の head のコミット。--head があれば push 済みの origin/<branch> を優先し、なければ HEAD
