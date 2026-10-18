@@ -42,7 +42,7 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
   - ユーザーが自分のターミナルで実行したコマンドや、GitHub の画面・MCP ツールで作る PR は対象外
 - **比べるのは、PR に入るコミット済みの内容。** `gh pr create` では作る PR の内容、`git push` では push した後の PR の内容
   - 場所:コマンドの中に `cd` があれば、移った先のリポジトリ(`$(...)` の中の `cd` はサブシェルで動くので、外側のコマンドには効かない)。Windows では、ドライブ文字付きのパス(`D:/...`、`D:\...`、`D:`)と、Git Bash・MSYS2 の形(`/d/...`)、Cygwin の形(`/cygdrive/d/...`)も絶対パスとして扱う
-  - base ブランチ:`gh pr create` の `--base` / `-B` の指定があればそれを使い、なければ PR を出す先のリポジトリの既定ブランチ(`gh repo view` で確かめる。`-R` / `--repo` の指定があればそのリポジトリ)。`git push` では、開いている PR の base。どちらも、PR を出す先のリポジトリを指す remote の `<remote>/<base>` を優先する。fork の構成(`origin` が自分の fork、`upstream` が元のリポジトリ)なら `upstream/<base>` になり、fork 側の古い `origin/<base>` との差分にはならない。そのリポジトリを指す remote がない、または `gh` で確かめられないときは `origin` を使う。`<remote>/<base>` は最後に fetch した時点のものなので、古ければ先に fetch する
+  - base ブランチ:`gh pr create` の `--base` / `-B` の指定があればそれを使い、なければ PR を出す先のリポジトリの既定ブランチ(`gh repo view` で確かめる。`-R` / `--repo` の指定があればそのリポジトリ。remote が 1 つで `-R` もなければ、問い合わせずにその remote の既定ブランチを使う)。`git push` では、開いている PR の base。どちらも、PR を出す先のリポジトリを指す remote の `<remote>/<base>` を優先する。fork の構成(`origin` が自分の fork、`upstream` が元のリポジトリ)なら `upstream/<base>` になり、fork 側の古い `origin/<base>` との差分にはならない。そのリポジトリを指す remote がない、または `gh` で確かめられないときは `origin` を使う。`<remote>/<base>` をまだ fetch していなければ `origin/<base>` を使う。`<remote>/<base>` は最後に fetch した時点のものなので、古ければ先に fetch する
   - head:`gh pr create` では、`--head` / `-H` の指定があればそのブランチ(push 済みの `origin/<指定>` を優先)。なければ `HEAD`。`git push` では、push するローカルのコミット
   - 実装:`git diff <base>...<head>`
   - ドキュメント:head 時点の、git 管理下の `*.md` / `*.mdx` すべて
