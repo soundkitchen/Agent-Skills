@@ -84,7 +84,7 @@ function world(
     if (url !== null) return url[1]! in remotes ? ok(`${remotes[url[1]!]}\n`) : fail
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return ok(`${HEAD}\n`)
     if (sub === 'rev-parse --verify --quiet fix/foo^{commit}') return ok(`${HEAD}\n`)
-    if (sub === 'symbolic-ref --short refs/remotes/origin/HEAD') return ok('origin/main\n')
+    if (sub === 'symbolic-ref --short refs/remotes/origin/HEAD' && 'origin' in remotes) return ok('origin/main\n')
     if (sub === 'rev-parse --verify --quiet origin/main^{commit}') return ok('deadbeef\n')
     if (sub === 'rev-parse --verify --quiet upstream/main^{commit}' && 'upstream' in remotes && opts.unfetched !== true) return ok('cafe00\n')
     if (sub === 'rev-parse --verify --quiet origin/feature/x^{commit}') return ok(`${FEATURE_HEAD}\n`)
@@ -276,6 +276,13 @@ describe('docs-sync', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.gh).toEqual([])
     expect(calls.git).toContain(`diff --no-color origin/main...${HEAD}`)
+  })
+
+  test('uses the only remote even when it is not named origin', async ($, on) => {
+    const calls = world(on, { remotes: { upstream: 'https://github.com/o/r.git' }, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.gh).toEqual([])
+    expect(calls.git).toContain(`diff --no-color upstream/main...${HEAD}`)
   })
 
   test('names the branch and the remote when the default base cannot be resolved', async ($, on) => {

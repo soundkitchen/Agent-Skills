@@ -90,8 +90,9 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
   // PR を出す先のリポジトリ(fork の構成なら元のリポジトリ)と、その既定のブランチ。
   // remote が 1 つで -R もなければ、その remote を使うしかないので gh には問い合わせない
   const remotes = await remoteRepos($, root)
-  const target = pr.repo !== undefined || remotes.size > 1 ? await ghRepo($, root, pr.repo) : undefined
-  const remote = remoteFor(remotes, target?.repo)
+  const only = pr.repo === undefined && remotes.size === 1 ? [...remotes.keys()][0] : undefined
+  const target = only === undefined ? await ghRepo($, root, pr.repo) : undefined
+  const remote = only ?? remoteFor(remotes, target?.repo)
   const branch = pr.base ?? target?.defaultBranch
   const base = await resolveBase($, root, remote, branch)
   if (base === undefined) throw new CheckFailed(baseFailure(remote, branch))
@@ -269,11 +270,13 @@ async function resolveBase($: EngineInterface, root: string, remote: string, bra
   const remotes = remote === 'origin' ? ['origin'] : [remote, 'origin']
   const candidates = branch !== undefined ? [...remotes.map(r => `${r}/${branch}`), branch] : []
   if (branch === undefined) {
+    // remote ごとに、既定ブランチ(<remote>/HEAD が指すもの)、<remote>/main の順に試す
     for (const r of remotes) {
       const remoteHead = await git($, ['symbolic-ref', '--short', `refs/remotes/${r}/HEAD`], root)
       if (remoteHead !== undefined) candidates.push(remoteHead)
+      candidates.push(`${r}/main`)
     }
-    candidates.push(...remotes.map(r => `${r}/main`), 'main')
+    candidates.push('main')
   }
   for (const ref of candidates) {
     if ((await git($, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], root)) !== undefined) return ref
