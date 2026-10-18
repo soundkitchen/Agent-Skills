@@ -21,7 +21,7 @@ const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName
 // 今のブランチは fix/foo(upstream は origin/fix/foo)。remote は、remotes を省略すると origin(o/r)と fork(me/r)。
 // prs は GitHub にある PR で、gh pr list --state open は開いているものだけを返す。
 // gh repo view は、-R の指定がなければ o/r を返す(既定のブランチは defaultBranch、省略すると main)。ghRepoFails なら失敗する。
-// unfetched なら upstream/main はまだ fetch していない
+// unfetched なら upstream/main はまだ fetch していない。partial は partial clone の remote の名前
 function world(
   on: On,
   opts: {
@@ -33,6 +33,7 @@ function world(
     defaultBranch?: string
     ghRepoFails?: boolean
     unfetched?: boolean
+    partial?: string
     model: Model
   },
 ) {
@@ -79,7 +80,10 @@ function world(
     if (sub === 'symbolic-ref --short --quiet HEAD') return ok('fix/foo\n')
     if (sub === 'config branch.fix/foo.remote') return ok('origin\n')
     if (sub === 'config branch.fix/foo.merge') return ok('refs/heads/fix/foo\n')
-    if (sub === 'remote -v') return ok(Object.entries(remotes).map(([n, u]) => `${n}\t${u} (fetch)\n${n}\t${u} (push)\n`).join(''))
+    // partial clone の remote は、fetch の行末に [blob:none] が付く
+    if (sub === 'remote -v') {
+      return ok(Object.entries(remotes).map(([n, u]) => `${n}\t${u} (fetch)${opts.partial === n ? ' [blob:none]' : ''}\n${n}\t${u} (push)\n`).join(''))
+    }
     const url = /^remote get-url --push (\S+)$/.exec(sub)
     if (url !== null) return url[1]! in remotes ? ok(`${remotes[url[1]!]}\n`) : fail
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return ok(`${HEAD}\n`)
@@ -283,6 +287,20 @@ describe('docs-sync', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.gh).toEqual([])
     expect(calls.git).toContain(`diff --no-color upstream/main...${HEAD}`)
+  })
+
+  test('counts a partial clone remote, whose line in git remote -v has [blob:none]', async ($, on) => {
+    const remotes = { upstream: 'https://github.com/o/r.git', fork: 'git@github.com:me/r.git' }
+    const calls = world(on, { remotes, partial: 'upstream', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.gh).toEqual(['repo view --json nameWithOwner,defaultBranchRef'])
+    expect(calls.git).toContain(`diff --no-color upstream/main...${HEAD}`)
+  })
+
+  test('asks gh when the other remote has a URL that is not a repository', async ($, on) => {
+    const calls = world(on, { remotes: { origin: 'git@github.com:o/r.git', local: 'mirror' }, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.gh.length).toBe(1)
   })
 
   test('names the branch and the remote when the default base cannot be resolved', async ($, on) => {

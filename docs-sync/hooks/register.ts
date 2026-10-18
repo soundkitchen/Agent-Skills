@@ -90,9 +90,9 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
   // PR を出す先のリポジトリ(fork の構成なら元のリポジトリ)と、その既定のブランチ。
   // remote が 1 つで -R もなければ、その remote を使うしかないので gh には問い合わせない
   const remotes = await remoteRepos($, root)
-  const only = pr.repo === undefined && remotes.size === 1 ? [...remotes.keys()][0] : undefined
+  const only = pr.repo === undefined && remotes.names.length === 1 ? remotes.names[0] : undefined
   const target = only === undefined ? await ghRepo($, root, pr.repo) : undefined
-  const remote = only ?? remoteFor(remotes, target?.repo)
+  const remote = only ?? remoteFor(remotes.repos, target?.repo)
   const branch = pr.base ?? target?.defaultBranch
   const base = await resolveBase($, root, remote, branch)
   if (base === undefined) throw new CheckFailed(baseFailure(remote, branch))
@@ -117,7 +117,7 @@ async function checkPushes($: EngineInterface, pushes: Push[], signal: AbortSign
 // push 1 つ分。push 先のブランチに開いている PR があれば、push するコミットで PR の内容を判定する。
 // 判定するものがなければ undefined。refspec が複数あれば順に判定し、最初のずれで止める
 // コマンドの中の push で使い回す、リポジトリ(root)ごとの開いている PR の一覧と、remote からリポジトリへの対応
-type PushCache = { prs: Map<string, OpenPr[] | undefined>; remotes: Map<string, Map<string, string>> }
+type PushCache = { prs: Map<string, OpenPr[] | undefined>; remotes: Map<string, Remotes> }
 
 async function checkPush($: EngineInterface, push: Push, cache: PushCache, signal: AbortSignal): Promise<Verdict | undefined> {
   // push 先が今のブランチや設定で決まる push の前に mover があると、mover がブランチや設定を変えうるので、
@@ -149,7 +149,7 @@ async function checkPush($: EngineInterface, push: Push, cache: PushCache, signa
     const head = await firstCommit($, root, [ref.src])
     if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
     if (!cache.remotes.has(root)) cache.remotes.set(root, await remoteRepos($, root))
-    const baseRemote = remoteFor(cache.remotes.get(root)!, pr.baseRepo)
+    const baseRemote = remoteFor(cache.remotes.get(root)!.repos, pr.baseRepo)
     const base = await resolveBase($, root, baseRemote, pr.base)
     if (base === undefined) throw new CheckFailed(`${baseFailure(baseRemote, pr.base)} for PR #${pr.number}`)
     const v = await check($, root, base, head, signal)
@@ -288,18 +288,25 @@ async function resolveBase($: EngineInterface, root: string, remote: string, bra
 function baseFailure(remote: string, branch: string | undefined): string {
   return branch !== undefined
     ? `could not resolve the base branch ${branch} (tried ${remote}/${branch}${remote === 'origin' ? '' : `, origin/${branch}`} and ${branch})`
-    : `could not resolve the default branch of ${remote}`
+    : `could not resolve the default branch of ${remote} (tried ${remote}/HEAD, ${remote}/main${remote === 'origin' ? '' : ', origin/HEAD, origin/main'} and main)`
 }
 
-// remote の名前から、それが指すリポジトリ(owner/name、小文字)への対応。git remote -v の fetch の URL から作る
-async function remoteRepos($: EngineInterface, root: string): Promise<Map<string, string>> {
-  const out = new Map<string, string>()
+// names はすべての remote の名前、repos は remote の名前からそれが指すリポジトリ(owner/name、小文字)への対応
+// (URL からリポジトリを読み取れた remote だけ)
+type Remotes = { names: string[]; repos: Map<string, string> }
+
+// git remote -v の fetch の行から、remote の一覧を作る。partial clone の remote は行末に [blob:none] などが付く
+async function remoteRepos($: EngineInterface, root: string): Promise<Remotes> {
+  const names: string[] = []
+  const repos = new Map<string, string>()
   for (const line of ((await git($, ['remote', '-v'], root)) ?? '').split('\n')) {
-    const m = /^(\S+)\s+(\S+)\s+\(fetch\)$/.exec(line)
-    const repo = m === null ? undefined : repoOf(m[2]!)
-    if (m !== null && repo !== undefined) out.set(m[1]!, repo)
+    const m = /^(\S+)\s+(\S+)\s+\(fetch\)(?:\s.*)?$/.exec(line)
+    if (m === null) continue
+    names.push(m[1]!)
+    const repo = repoOf(m[2]!)
+    if (repo !== undefined) repos.set(m[1]!, repo)
   }
-  return out
+  return { names, repos }
 }
 
 // リポジトリ(owner/name)を指す remote。origin が指していれば origin、なければほかの remote から探す。
