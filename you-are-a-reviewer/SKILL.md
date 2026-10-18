@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # Reviewer mode
 
-From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work. This session is read-only: never modify the working tree; fixing the findings is the requester's job.
+From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work. This session is read-only: never modify the working tree; fixing the findings is the requester's job. The only things this session writes to the repository are the PR refs it fetches for review (`refs/pr/<n>`), and it deletes such a ref when a requester notifies it that the PR was merged (see "Messages that are not review requests").
 
 **Always write in the specified language**: the replies to the requester, and the reports and questions to the user. The language is the one specified in the user's settings or instructions (e.g. the `language` setting, CLAUDE.md, or the project's rules); if none is specified, use the language the request (for replies) or the user (for reports) is written in. Do not switch to English just because these instructions are in English.
 
@@ -66,7 +66,7 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
    - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit into a dedicated ref: `git fetch <remote> +pull/<n>/head:refs/pr/<n>`, where `<remote>` is the git remote that points to the PR's repository (check `git remote -v`; in a fork setup this is usually `upstream`). If no remote points to it, ask the user. The `+` overwrites the ref on re-review; this does not touch the working tree. During the review, read any file contents needed for context from that ref (`git show refs/pr/<n>:<path>`), not from this working tree. Do not store it under `refs/remotes/`: git treats that as a remote-tracking branch, so `fetch --prune` from any worktree could delete it
 4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
-   - First line: a self-contained summary such as "PR #12 のレビュー結果: 指摘 N 件"
+   - First line: a self-contained summary such as "Review of PR #12: N findings" (in the specified language, like the rest of the message)
    - The exact code-review arguments actually used, and the PR head commit that was reviewed
    - The full findings, most severe first (file:line, what is wrong, how it breaks)
    - If there are no findings, say so
@@ -87,7 +87,7 @@ A request is a re-review when this session has already reviewed the same PR and 
 4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything else about the code that was already reviewed
 5. If the changes since the commit you last reviewed include changes unrelated to addressing the open points (e.g. a new feature added after an LGTM), review those changes with code-review: run it on the PR as in step 3 above, and keep only the findings located in those changes. If `--comment` is in effect, code-review may post findings outside those changes too, so say so in the reply
 6. Send the result back with SendMessage as in step 4 above. The message must include:
-   - First line: a self-contained summary such as "PR #12 の再レビュー結果: 前回の指摘 N 件中 M 件解消"
+   - First line: a self-contained summary such as "Re-review of PR #12: M of N previous findings resolved" (in the specified language, like the rest of the message)
    - The PR head commit that was checked
    - The status of each open point, with the reason
    - Any problems introduced by the fixes
@@ -102,6 +102,7 @@ Not every message from a requester is a review request. For example, a requester
 
 - Do not run any review, and do not treat commits listed in it as changes to review
 - Consider the review of that PR finished: later requests for the same PR are handled as a first review
+- If the notice says the PR was merged, delete the ref you fetched for that PR (`git update-ref -d refs/pr/<n>`), if it exists. Delete only that one ref; leave the refs of other PRs alone, since their reviews may still be going on
 - Briefly tell the user. No reply to the requester is needed
 
 If you are not sure whether a message asks for a review, ask the requester instead of reviewing.

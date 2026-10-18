@@ -45,14 +45,14 @@ The reviewer only reviews PRs, and only what has been pushed.
 
 ## 3. Send the request
 
-Send the request with SendMessage to the reviewer. Write it in the specified language (see the top). The first line must be a self-contained summary such as "PR #12 のレビューをお願いします". Include:
+Send the request with SendMessage to the reviewer. Write it in the specified language (see the top). The first line must be a self-contained summary such as "Please review PR #12" (in the specified language, like the rest of the message). Include:
 
 - The PR URL and number, and the PR head commit to review
 - The local repository path (the reviewer may work in the same repository)
 - A summary of what the PR changes
-- The level and flags, if any were given (e.g. "レベルは high、フラグは --comment でお願いします"). Otherwise say that no level or flags are specified
+- The level and flags, if any were given (e.g. "Level: high, flags: --comment"). Otherwise say that no level or flags are specified
 - For a re-review (see below): the open points from the previous review, the commit the reviewer last reviewed, and what was changed for each point. For a point that was decided not to be fixed (e.g. by the user's decision), say so with the reason, so that the reviewer can close it instead of reporting it as unresolved again
-- "指摘がなければ LGTM と返してください"
+- A request to reply "LGTM" if there are no findings (keep the word "LGTM" as is, so that the reviewer's reply can be recognized)
 
 Then tell the user that the request was sent and you are waiting for the result. Do not poll; the reviewer's reply arrives as a `<cross-session-message>`. To reply to the reviewer within the same review, use the `from` attribute of its latest message as `to`.
 
@@ -85,7 +85,7 @@ If the user later asks you to merge a PR that was reviewed through this skill in
 
 - That the PR was merged, with the merge commit
 - Whether the merged head is the commit the reviewer gave LGTM to. If commits were added after the LGTM, say so and list them
-- That there are no further requests for this PR, and that this message is only a notice and needs no review (write it in the first line, e.g. "PR #12 をマージしました(通知のみで、レビューは不要です)")
+- That there are no further requests for this PR, and that this message is only a notice and needs no review (write it in the first line, e.g. "PR #12 was merged (notice only, no review needed)")
 
 This applies only when this session does the merge. If the PR is merged elsewhere (e.g. on GitHub or from another session), you cannot notice it, so do not send anything.
 
