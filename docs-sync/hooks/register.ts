@@ -112,9 +112,23 @@ async function resolveCwd($: EngineInterface, cds: string[]): Promise<string> {
       if (home === undefined) throw new CheckFailed('could not resolve ~ in cd')
       target = home + target.slice(1)
     }
-    cwd = target.startsWith('/') ? target : `${cwd}/${target}`
+    cwd = joinDir(cwd, target)
   }
   return cwd
+}
+
+// Windows のドライブ文字付きの絶対パス(D:/ や D:\)
+const DRIVE_PATH = /^[A-Za-z]:[\\/]/
+
+// cd の行き先を、今いる場所から求める。cwd がドライブ文字で始まるとき(Windows)は、
+// D:/ や D:\ を絶対パスとして扱い、Git Bash の /d/... は git が解決できる D:/... に直す
+export function joinDir(cwd: string, target: string): string {
+  if (DRIVE_PATH.test(cwd)) {
+    if (DRIVE_PATH.test(target)) return target
+    const mount = /^\/([A-Za-z])(\/.*)?$/.exec(target)
+    if (mount !== null) return `${mount[1]!.toUpperCase()}:${mount[2] ?? '/'}`
+  }
+  return target.startsWith('/') ? target : `${cwd}/${target}`
 }
 
 // PR の head のコミット。--head があれば push 済みの origin/<branch> を優先し、なければ HEAD

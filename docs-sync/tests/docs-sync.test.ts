@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { parseJson, parsePrCreate, splitCommand } from '../hooks/register.ts'
+import { joinDir, parseJson, parsePrCreate, splitCommand } from '../hooks/register.ts'
 
 // 区切りごとの単語だけを取り出す(置換の中は含めない)
 const wordsOf = (command: string) => splitCommand(command).map(s => s.words)
@@ -13,12 +13,12 @@ const SESSION_MODEL = 'claude-opus-5-5'
 type Model = (prompt: string) => { text: string } | { reason: 'empty-reply' }
 
 // git と model を差し替え、Bash の実行は「走った」ことだけを記録する
-function world(on: On, opts: { diff?: string; docs?: Record<string, string>; model: Model }) {
+function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string, string>; model: Model }) {
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
   const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], cwds: [] as string[] }
 
   mock.store(on)
-  on('session.cwd', async () => ({ value: ROOT }))
+  on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
   on('session.model', async () => ({ value: SESSION_MODEL }))
 
   on('process.run', async ($, e) => {
@@ -161,6 +161,13 @@ describe('docs-sync', () => {
     expect(calls.cwds).toEqual([`${ROOT}/../other`])
   })
 
+  test('treats a Windows drive path after cd as absolute', async ($, on) => {
+    const calls = world(on, { cwd: 'D:\\works\\hogehoge', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'cd D:/works/hogehoge && gh pr create --base main --fill' })
+    expect(calls.cwds).toEqual(['D:/works/hogehoge'])
+    expect(calls.ran).toHaveLength(1)
+  })
+
   test('checks the branch given with --head instead of HEAD', async ($, on) => {
     const calls = world(on, { model: OK })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --head feature/x --fill' })
@@ -282,6 +289,25 @@ describe('splitCommand', () => {
 
   test('skips heredoc bodies', async () => {
     expect(wordsOf('cat <<-EOF > x\n\tgh pr create\n\tEOF\nnext')).toEqual([['cat', '>', 'x'], ['next']])
+  })
+})
+
+describe('joinDir', () => {
+  test('joins a relative path and keeps a POSIX absolute path', async () => {
+    expect(joinDir('/repo', '../other')).toBe('/repo/../other')
+    expect(joinDir('/repo', '/d/works')).toBe('/d/works')
+  })
+
+  test('treats drive paths as absolute when the session runs on Windows', async () => {
+    expect(joinDir('D:\\works\\a', 'E:/b')).toBe('E:/b')
+    expect(joinDir('D:\\works\\a', 'E:\\b')).toBe('E:\\b')
+    expect(joinDir('D:\\works\\a', 'sub')).toBe('D:\\works\\a/sub')
+  })
+
+  test('turns a Git Bash /d/... path into a drive path on Windows', async () => {
+    expect(joinDir('C:\\Users\\me', '/d/works/a')).toBe('D:/works/a')
+    expect(joinDir('C:\\Users\\me', '/d')).toBe('D:/')
+    expect(joinDir('C:\\Users\\me', '/usr/bin')).toBe('/usr/bin')
   })
 })
 
