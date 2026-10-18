@@ -1,6 +1,6 @@
 {
   "name": "docs-sync",
-  "version": "0.1.0",
-  "description": "Blocks gh pr create until the branch's docs match its implementation",
+  "version": "0.2.0",
+  "description": "Blocks gh pr create, and pushes to a branch with an open PR, until the branch's docs match its implementation",
   "author": { "name": "Takanobu Izukawa" }
 }
