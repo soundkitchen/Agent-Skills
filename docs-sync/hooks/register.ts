@@ -109,6 +109,9 @@ async function checkPushes($: EngineInterface, pushes: Push[], signal: AbortSign
 // push 1 つ分。push 先のブランチに開いている PR があれば、push するコミットで PR の内容を判定する。
 // 判定するものがなければ undefined。refspec が複数あれば順に判定し、最初のずれで止める
 async function checkPush($: EngineInterface, push: Push, prsByRoot: Map<string, OpenPr[] | undefined>, signal: AbortSignal): Promise<Verdict | undefined> {
+  // push 先が今のブランチや設定で決まる push の前に mover があると、mover がブランチや設定を変えうるので、
+  // 実行前の今の状態からは push 先(と開いている PR があるか)がわからない。PR の有無に関係なく分けて実行させる
+  if (push.mover !== undefined && dependsOnCurrentState(push)) return { status: 'split', mover: push.mover }
   // 場所がわからなければ、開いている PR があるかもわからないので、PR がないときと同じく判定しない
   let root: string
   try {
@@ -141,6 +144,12 @@ async function checkPush($: EngineInterface, push: Push, prsByRoot: Map<string, 
     details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
   }
   return details.length > 0 ? { status: 'ok', detail: details.join('; ') } : undefined
+}
+
+// push 先が、今のブランチや設定(upstream・pushRemote など)で決まる push か。
+// remote か refspec を省いたもの、push 先が HEAD(今のブランチ)の refspec を含むもの
+function dependsOnCurrentState(push: Push): boolean {
+  return push.remote === undefined || push.refs.length === 0 || push.refs.some(ref => (ref.dst ?? ref.src).replace(/^\+/, '') === 'HEAD')
 }
 
 // コマンド内の cd をたどった先の、git リポジトリのルート
@@ -739,11 +748,13 @@ export function splitCommand(command: string): Segment[] {
       }
       let j = c === '&' ? i + 2 : i + 1
       if (command[j] === '>' || command[j] === '|') j += 1
-      if (command[j] === '&') {
+      if (command[j] === '&' && /[0-9-]/.test(command[j + 1] ?? '')) {
         // 2>&1 のような fd の複製。リダイレクト先は数字か -
         j += 1
         while (j < command.length && /[0-9-]/.test(command[j]!)) j += 1
       } else {
+        // >& file は、stdout と stderr をファイルへ送る。リダイレクト先は次の単語
+        if (command[j] === '&') j += 1
         dropNext = true
       }
       i = j

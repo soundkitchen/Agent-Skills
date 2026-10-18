@@ -38,7 +38,7 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
     - `git -C <dir>` は `cd` と同じく扱う(`--work-tree` は作業ツリーを変えるだけなので、場所は変えない)。`--git-dir` は、`.git` を指すならその親へ移り、それ以外(bare リポジトリなど)は判定しない
     - ブランチの削除(`--delete` / `-d` / `:branch`)、dry run(`--dry-run` / `-n`)、`--all` / `--mirror`、refspec のない `--tags` は判定しない
     - `git push ... && gh pr create ...` のように同じコマンドに `gh pr create` があれば、`gh pr create` として 1 回だけ判定する。同じコマンドに push が複数あれば、すべてを順に判定する
-  - 同じコマンドの中で、`gh pr create` や判定する `git push` より前に、読むだけでない git コマンド(`commit`・`add`・`checkout`・`branch` など、`status`・`log`・`diff`・`show`・`fetch` などの読むだけのもの以外)や `gh pr checkout` があるときは、判定せずに止め、分けて実行するよう Claude に伝える。`$(...)` の中にあるものも含む。docs-sync はコマンドを実行する前に判定するので、そのコマンドで作られる・動かされるコミットを見られないため。開いている PR がないブランチへの push(`git commit && git push -u origin <新しいブランチ>` など)は止めない
+  - 同じコマンドの中で、`gh pr create` や判定する `git push` より前に、読むだけでない git コマンド(`commit`・`add`・`checkout`・`branch` など、`status`・`log`・`diff`・`show`・`fetch` などの読むだけのもの以外)や `gh pr checkout` があるときは、判定せずに止め、分けて実行するよう Claude に伝える。`$(...)` の中にあるものも含む。docs-sync はコマンドを実行する前に判定するので、そのコマンドで作られる・動かされるコミットを見られないため。push 先のリモートとブランチを書いた push で、開いている PR がないもの(`git commit && git push -u origin <新しいブランチ>` など)は止めない。remote や refspec を省いた push と、`HEAD` へ push するものは、そのコマンドで今のブランチや設定が変わりうるので、PR の有無に関係なく止める(`git commit && git push` など)
   - ユーザーが自分のターミナルで実行したコマンドや、GitHub の画面・MCP ツールで作る PR は対象外
 - **比べるのは、PR に入るコミット済みの内容。** `gh pr create` では作る PR の内容、`git push` では push した後の PR の内容
   - 場所:コマンドの中に `cd` があれば、移った先のリポジトリ(`$(...)` の中の `cd` はサブシェルで動くので、外側のコマンドには効かない)。Windows では、ドライブ文字付きのパス(`D:/...`、`D:\...`、`D:`)と、Git Bash・MSYS2 の形(`/d/...`)、Cygwin の形(`/cygdrive/d/...`)も絶対パスとして扱う

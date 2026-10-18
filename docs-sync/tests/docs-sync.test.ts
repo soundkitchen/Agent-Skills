@@ -352,6 +352,16 @@ describe('docs-sync on git push', () => {
     expect(calls.ran).toEqual([])
   })
 
+  test('asks Claude to split the command when the push target depends on a branch the command may change', async ($, on) => {
+    const calls = world(on, { prs: [], model: OK })
+    for (const command of ['git checkout feature/x && git push', 'gh pr checkout 12 && git push origin', 'git commit -m x && git push origin HEAD']) {
+      const r = await $.tool.call({ tool: 'Bash', command })
+      expect(r.deny).toContain('the push was blocked because this command runs')
+    }
+    expect(calls.gh).toEqual([])
+    expect(calls.ran).toEqual([])
+  })
+
   test('lets a commit and a push in one command run when the branch has no open PR', async ($, on) => {
     const calls = world(on, { prs: [], model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'git commit -m fix && git push -u origin fix/foo' })
@@ -537,6 +547,7 @@ describe('splitCommand', () => {
     expect(wordsOf('git push 2>&1 | tail -1')).toEqual([['git', 'push'], ['tail', '-1']])
     expect(wordsOf('git push origin x > /tmp/log 2>> err &> all < in')).toEqual([['git', 'push', 'origin', 'x']])
     expect(wordsOf('echo a>b c')).toEqual([['echo', 'a', 'c']])
+    expect(wordsOf('git push origin >& log; echo x >&2; echo y >&-')).toEqual([['git', 'push', 'origin'], ['echo', 'x'], ['echo', 'y']])
   })
 })
 
