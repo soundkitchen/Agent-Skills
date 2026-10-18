@@ -30,7 +30,7 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
 - **割り込むのは、実際に `gh pr create` を実行するときと、開いている PR があるブランチへ `git push` するときだけ。**
   - 対象は Claude の Bash ツールの呼び出し。コマンドを `&&` `;` `|` などで区切り、`gh pr create` か `git push` で始まる部分があるものだけを判定する(`git push && gh pr create ...` のような連結も含む)。先頭の環境変数の指定(`NAME=value`)や、`env` `command` `time` `nohup` `exec` の前置きは飛ばして見る
   - `$(...)` やバッククォートの中で実行される `gh pr create` や `git push` も対象(`PR_URL=$(gh pr create ...)` など)
-  - 引用符・ヒアドキュメントの中の文字列には反応しない。コミットメッセージや PR へのコメントの本文に「gh pr create」と書いてあっても、判定しない。`--title` や `--body` の値も、`--base` / `--head` として読まない
+  - 引用符・ヒアドキュメントの中の文字列には反応しない。コミットメッセージや PR へのコメントの本文に「gh pr create」と書いてあっても、判定しない。`--title` や `--body` の値も、`--base` / `--head` として読まない。リダイレクト(`> file`・`2>&1` など)も、引数として読まない
   - `gh pr create --help` も判定しない
   - `git push` は、push で更新される開いている PR があるときだけ判定する。開いている PR の一覧を `gh pr list --state open` で 1 回だけ取り、head のリポジトリとブランチが push 先と一致するものを探す。PR がないときや、PR があるかを確かめられないとき(`gh` が使えない、remote の URL からリポジトリを読み取れない、`cd "$DIR"` のように場所を読み取れない、など)は、判定せずにそのまま push する(PR を作るときに判定する)
     - push 先のリポジトリは、push 先の remote の URL から求める。remote の指定がなければ、git と同じく `branch.<名前>.pushRemote`・`remote.pushDefault`・upstream の remote・`origin` の順に決める。そのため、fork に push しても、元のリポジトリから出した PR は判定しない(fork から出した PR は判定する)

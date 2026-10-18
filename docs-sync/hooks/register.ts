@@ -658,22 +658,29 @@ export type Segment = { words: string[]; subs: Segment[][] }
 
 // シェルのコマンドを、&& ; | ( ) 改行で区切られた単語の列に分ける。
 // 引用符は外して 1 つの単語にする。$(...) とバッククォートは中身ごと 1 つの単語の一部にしたうえで、
-// 中で実行されるコマンドも、その区切りの subs として解析する。ヒアドキュメントの本文とコメントは読み飛ばす
+// 中で実行されるコマンドも、その区切りの subs として解析する。ヒアドキュメントの本文とコメントは読み飛ばす。
+// リダイレクト(> file、2>&1、&> file など)は、演算子もリダイレクト先も単語に含めない
 export function splitCommand(command: string): Segment[] {
   const segments: Segment[] = []
   let words: string[] = []
   let subs: Segment[][] = []
   let word = ''
   let inWord = false
+  // 次の単語がリダイレクト先なら true
+  let dropNext = false
   const heredocs: Heredoc[] = []
 
   const endWord = () => {
-    if (inWord) words.push(word)
+    if (inWord) {
+      if (dropNext) dropNext = false
+      else words.push(word)
+    }
     word = ''
     inWord = false
   }
   const endSegment = () => {
     endWord()
+    dropNext = false
     if (words.length > 0 || subs.length > 0) segments.push({ words, subs })
     words = []
     subs = []
@@ -722,6 +729,24 @@ export function splitCommand(command: string): Segment[] {
       const r = readHeredocOp(command, i)
       heredocs.push(r.heredoc)
       i = r.end
+    } else if (c === '>' || c === '<' || (c === '&' && command[i + 1] === '>')) {
+      // 直前の fd の数字(2> の 2)も、リダイレクトの一部として捨てる
+      if (inWord && /^\d+$/.test(word)) {
+        word = ''
+        inWord = false
+      } else {
+        endWord()
+      }
+      let j = c === '&' ? i + 2 : i + 1
+      if (command[j] === '>' || command[j] === '|') j += 1
+      if (command[j] === '&') {
+        // 2>&1 のような fd の複製。リダイレクト先は数字か -
+        j += 1
+        while (j < command.length && /[0-9-]/.test(command[j]!)) j += 1
+      } else {
+        dropNext = true
+      }
+      i = j
     } else if (';&|()'.includes(c)) {
       endSegment()
       i += 1

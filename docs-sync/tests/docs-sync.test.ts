@@ -374,6 +374,13 @@ describe('docs-sync on git push', () => {
     expect(calls.model).toBe(1)
   })
 
+  test('checks a push whose output is redirected', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push 2>&1 | tail -1' })
+    expect(r.deny).toContain('the push was blocked')
+    expect(calls.ran).toEqual([])
+  })
+
   test('checks every push in the command, not only the first one', async ($, on) => {
     const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push -u origin new && git push origin fix/foo' })
@@ -466,6 +473,11 @@ describe('parsePush', () => {
     expect(parsePush('git push --tags origin main')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'main' }] }])
   })
 
+  test('does not take redirections as the remote or refspecs', async () => {
+    expect(parsePush('git push 2>&1 | tail -3')).toEqual([{ cds: [], refs: [] }])
+    expect(parsePush('git push -q origin fix/foo >/dev/null 2>&1')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'fix/foo' }] }])
+  })
+
   test('applies cd and the git options that change the place', async () => {
     expect(parsePush('cd a && git -C b -c x=y push')).toEqual([{ cds: ['a', 'b'], refs: [] }])
     expect(parsePush('git --work-tree=/other --namespace n push')).toEqual([{ cds: [], refs: [] }])
@@ -518,7 +530,13 @@ describe('splitCommand', () => {
   })
 
   test('skips heredoc bodies', async () => {
-    expect(wordsOf('cat <<-EOF > x\n\tgh pr create\n\tEOF\nnext')).toEqual([['cat', '>', 'x'], ['next']])
+    expect(wordsOf('cat <<-EOF > x\n\tgh pr create\n\tEOF\nnext')).toEqual([['cat'], ['next']])
+  })
+
+  test('drops redirections and their targets', async () => {
+    expect(wordsOf('git push 2>&1 | tail -1')).toEqual([['git', 'push'], ['tail', '-1']])
+    expect(wordsOf('git push origin x > /tmp/log 2>> err &> all < in')).toEqual([['git', 'push', 'origin', 'x']])
+    expect(wordsOf('echo a>b c')).toEqual([['echo', 'a', 'c']])
   })
 })
 
