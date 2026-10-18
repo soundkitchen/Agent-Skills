@@ -35,10 +35,10 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
   - `git push` は、push で更新される開いている PR があるときだけ判定する。開いている PR の一覧を `gh pr list --state open` で 1 回だけ取り、head のリポジトリとブランチが push 先と一致するものを探す。PR がないときや、PR があるかを確かめられないとき(`gh` が使えない、remote の URL からリポジトリを読み取れない、`cd "$DIR"` のように場所を読み取れない、など)は、判定せずにそのまま push する(PR を作るときに判定する)
     - push 先のリポジトリは、push 先の remote の URL から求める。remote の指定がなければ、git と同じく `branch.<名前>.pushRemote`・`remote.pushDefault`・upstream の remote・`origin` の順に決める。そのため、fork に push しても、元のリポジトリから出した PR は判定しない(fork から出した PR は判定する)
     - push 先のブランチは、refspec があればその push 先(`HEAD:fix/x` なら `fix/x`)。なければ今のブランチで、upstream の remote へ push するなら upstream のブランチ、ほかの remote なら同じ名前
-    - `git -C <dir>` と `--work-tree` は `cd` と同じく扱う。`--git-dir` は、`.git` を指すならその親へ移り、それ以外(bare リポジトリなど)は判定しない
+    - `git -C <dir>` は `cd` と同じく扱う(`--work-tree` は作業ツリーを変えるだけなので、場所は変えない)。`--git-dir` は、`.git` を指すならその親へ移り、それ以外(bare リポジトリなど)は判定しない
     - ブランチの削除(`--delete` / `-d` / `:branch`)、dry run(`--dry-run` / `-n`)、`--all` / `--mirror`、refspec のない `--tags` は判定しない
-    - `git push ... && gh pr create ...` のように同じコマンドに `gh pr create` があれば、`gh pr create` として 1 回だけ判定する。判定しない push(削除など)の後ろに別の push があれば、そちらを判定する
-  - 同じコマンドの中で、`gh pr create` や判定する `git push` より前に、コミットを作る・動かす git コマンド(`commit`・`merge`・`rebase`・`cherry-pick`・`revert`・`am`・`pull`・`reset`・`checkout`・`switch`)があるときは、判定せずに止め、分けて実行するよう Claude に伝える。docs-sync はコマンドを実行する前に判定するので、そのコマンドで作られる・動かされるコミットを見られないため。開いている PR がないブランチへの push(`git commit && git push -u origin <新しいブランチ>` など)は止めない
+    - `git push ... && gh pr create ...` のように同じコマンドに `gh pr create` があれば、`gh pr create` として 1 回だけ判定する。同じコマンドに push が複数あれば、すべてを順に判定する
+  - 同じコマンドの中で、`gh pr create` や判定する `git push` より前に、読むだけでない git コマンド(`commit`・`add`・`checkout`・`branch` など、`status`・`log`・`diff`・`show`・`fetch` などの読むだけのもの以外)や `gh pr checkout` があるときは、判定せずに止め、分けて実行するよう Claude に伝える。`$(...)` の中にあるものも含む。docs-sync はコマンドを実行する前に判定するので、そのコマンドで作られる・動かされるコミットを見られないため。開いている PR がないブランチへの push(`git commit && git push -u origin <新しいブランチ>` など)は止めない
   - ユーザーが自分のターミナルで実行したコマンドや、GitHub の画面・MCP ツールで作る PR は対象外
 - **比べるのは、PR に入るコミット済みの内容。** `gh pr create` では作る PR の内容、`git push` では push した後の PR の内容
   - 場所:コマンドの中に `cd` があれば、移った先のリポジトリ(`$(...)` の中の `cd` はサブシェルで動くので、外側のコマンドには効かない)。Windows では、ドライブ文字付きのパス(`D:/...`、`D:\...`、`D:`)と、Git Bash・MSYS2 の形(`/d/...`)、Cygwin の形(`/cygdrive/d/...`)も絶対パスとして扱う

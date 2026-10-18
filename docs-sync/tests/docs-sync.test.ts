@@ -346,7 +346,7 @@ describe('docs-sync on git push', () => {
   test('asks Claude to split the command when it commits before pushing to a branch with an open PR', async ($, on) => {
     const calls = world(on, { prs: [OPEN_PR], model: OK })
     const r = await $.tool.call({ tool: 'Bash', command: 'git add -A && git commit -m fix && git push' })
-    expect(r.deny).toContain('the push was blocked because this command runs git commit before git push')
+    expect(r.deny).toContain('the push was blocked because this command runs git add before git push')
     expect(r.deny).toContain('run git push as a separate command')
     expect(calls.model).toBe(0)
     expect(calls.ran).toEqual([])
@@ -372,6 +372,21 @@ describe('docs-sync on git push', () => {
     const r = await $.tool.call({ tool: 'Bash', command: 'git push && git checkout main' })
     expect(r.deny).toBe(undefined)
     expect(calls.model).toBe(1)
+  })
+
+  test('checks every push in the command, not only the first one', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push -u origin new && git push origin fix/foo' })
+    expect(r.deny).toContain('the push was blocked')
+    expect(calls.gh.length).toBe(1)
+    expect(calls.ran).toEqual([])
+  })
+
+  test('asks Claude to split the command when a later push comes after an amend', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push origin fix/foo; git commit --amend --no-edit; git push -f origin fix/foo' })
+    expect(r.deny).toContain('runs git commit before git push')
+    expect(calls.ran).toEqual([])
   })
 
   test('checks a push that comes after a push it does not check', async ($, on) => {
@@ -443,37 +458,48 @@ describe('parsePrCreate', () => {
 
 describe('parsePush', () => {
   test('reads the refspecs after the remote', async () => {
-    expect(parsePush('git push')).toEqual({ cds: [], refs: [] })
-    expect(parsePush('git push -u origin fix/foo')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'fix/foo' }] })
-    expect(parsePush('git push origin HEAD:fix/foo +a:b')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'HEAD', dst: 'fix/foo' }, { src: '+a', dst: 'b' }] })
-    expect(parsePush('git push -o ci.skip origin x')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'x' }] })
-    expect(parsePush('git push --repo=fork')).toEqual({ cds: [], remote: 'fork', refs: [] })
-    expect(parsePush('git push --tags origin main')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'main' }] })
+    expect(parsePush('git push')).toEqual([{ cds: [], refs: [] }])
+    expect(parsePush('git push -u origin fix/foo')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'fix/foo' }] }])
+    expect(parsePush('git push origin HEAD:fix/foo +a:b')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'HEAD', dst: 'fix/foo' }, { src: '+a', dst: 'b' }] }])
+    expect(parsePush('git push -o ci.skip origin x')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'x' }] }])
+    expect(parsePush('git push --repo=fork')).toEqual([{ cds: [], remote: 'fork', refs: [] }])
+    expect(parsePush('git push --tags origin main')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'main' }] }])
   })
 
   test('applies cd and the git options that change the place', async () => {
-    expect(parsePush('cd a && git -C b -c x=y push')).toEqual({ cds: ['a', 'b'], refs: [] })
-    expect(parsePush('git --work-tree=/other --namespace n push')).toEqual({ cds: ['/other'], refs: [] })
-    expect(parsePush('git --git-dir .git push')).toEqual({ cds: [], refs: [] })
-    expect(parsePush('git --git-dir=../repo/.git push')).toEqual({ cds: ['../repo'], refs: [] })
-    expect(parsePush('git --git-dir=/srv/bare.git push')).toBe(undefined)
+    expect(parsePush('cd a && git -C b -c x=y push')).toEqual([{ cds: ['a', 'b'], refs: [] }])
+    expect(parsePush('git --work-tree=/other --namespace n push')).toEqual([{ cds: [], refs: [] }])
+    expect(parsePush('git --git-dir .git push')).toEqual([{ cds: [], refs: [] }])
+    expect(parsePush('git --git-dir=../repo/.git push')).toEqual([{ cds: ['../repo'], refs: [] }])
+    expect(parsePush('git --git-dir=/srv/bare.git push')).toEqual([])
   })
 
   test('returns nothing for pushes that are not checked', async () => {
     for (const command of ['git push --delete origin x', 'git push -d origin x', 'git push --dry-run', 'git push -n', 'git push --tags', 'git push --all', 'git push --mirror', 'git push -h']) {
-      expect(parsePush(command)).toBe(undefined)
+      expect(parsePush(command)).toEqual([])
     }
   })
 
-  test('records a git command that makes or moves commits before the push', async () => {
-    expect(parsePush('git commit -m "x" && git -C . push')?.mover).toBe('git commit')
-    expect(parsePush('git fetch && git status && git push')?.mover).toBe(undefined)
-    expect(parsePush('git push && git commit -m x')?.mover).toBe(undefined)
+  test('records the first git command that is not read-only before each push', async () => {
+    expect(parsePush('git commit -m "x" && git -C . push')[0]?.mover).toBe('git commit')
+    expect(parsePush('git fetch && git status && git diff && git push')[0]?.mover).toBe(undefined)
+    expect(parsePush('git push && git commit -m x')[0]?.mover).toBe(undefined)
+    expect(parsePush('echo "$(git commit -am wip)" && git push')[0]?.mover).toBe('git commit')
+    expect(parsePush('git branch -f feature abc && git push origin feature')[0]?.mover).toBe('git branch')
+    expect(parsePush('gh pr checkout 3 && git push')[0]?.mover).toBe('gh pr checkout')
+  })
+
+  test('returns every push in the command, each with the mover before it', async () => {
+    expect(parsePush('git push origin a; git commit --amend; git push -f origin a')).toEqual([
+      { cds: [], remote: 'origin', refs: [{ src: 'a' }] },
+      { cds: [], remote: 'origin', refs: [{ src: 'a' }], mover: 'git commit' },
+    ])
+    expect(parsePush('git push origin --delete old && git push origin x')).toEqual([{ cds: [], remote: 'origin', refs: [{ src: 'x' }] }])
   })
 
   test('ignores git push inside quotes and other git commands', async () => {
-    expect(parsePush('git commit -m "then git push"')).toBe(undefined)
-    expect(parsePush('git pull')).toBe(undefined)
+    expect(parsePush('git commit -m "then git push"')).toEqual([])
+    expect(parsePush('git pull')).toEqual([])
   })
 })
 

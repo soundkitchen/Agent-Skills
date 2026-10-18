@@ -16,7 +16,7 @@ type Finding = { doc: string; issue: string; fix: string }
 type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: Finding[] } | { status: 'split'; mover: string }
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
-// mover は、同じコマンドの中で先に実行される、コミットを作る・動かす git コマンド(`git commit` など)
+// mover は、同じコマンドの中で先に実行される、読むだけでない git コマンド(`git commit` など)
 export type PrCreate = { cds: string[]; base?: string; head?: string; mover?: string }
 // コマンドから読み取った git push の内容。remote は push 先の指定(省略時は git の既定)、refs が空なら今のブランチを push する
 export type Push = { cds: string[]; remote?: string; refs: PushRef[]; mover?: string }
@@ -47,13 +47,13 @@ export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const pr = parsePrCreate(e.command)
     // gh pr create があれば、同じコマンドの git push は PR を作る前のものなので、gh pr create として判定する
-    const push = pr === undefined ? parsePush(e.command) : undefined
-    if (pr === undefined && push === undefined) return next(e)
+    const pushes = pr === undefined ? parsePush(e.command) : []
+    if (pr === undefined && pushes.length === 0) return next(e)
     const action = pr !== undefined ? PR_CREATE : PUSH
 
     let verdict: Verdict | undefined
     try {
-      verdict = pr !== undefined ? await checkPrCreate($, pr, next.signal) : await checkPush($, push!, next.signal)
+      verdict = pr !== undefined ? await checkPrCreate($, pr, next.signal) : await checkPushes($, pushes, next.signal)
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
       if (!(await confirmAfterFailure($, action, reason))) return { deny: failureDeny(action, reason) }
@@ -74,7 +74,7 @@ export const register: Register = on => {
 // hook が落ちたときの言い回しに使う。解析でも落ちるなら、PR の作成として扱う
 function actionOf(command: string): Action {
   try {
-    return parsePrCreate(command) === undefined && parsePush(command) !== undefined ? PUSH : PR_CREATE
+    return parsePrCreate(command) === undefined && parsePush(command).length > 0 ? PUSH : PR_CREATE
   } catch {
     return PR_CREATE
   }
@@ -91,9 +91,24 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
   return check($, root, base, head, signal)
 }
 
-// push 先のブランチに開いている PR があれば、push するコミットで PR の内容を判定する。
+// コマンドの中の push を順に見て、開いている PR を更新するものを、push するコミットで判定する。
+// 判定するものがなければ undefined。最初のずれ(または分けて実行させるもの)で止める
+async function checkPushes($: EngineInterface, pushes: Push[], signal: AbortSignal): Promise<Verdict | undefined> {
+  // 開いている PR の一覧は、リポジトリごとに 1 回だけ問い合わせる
+  const prsByRoot = new Map<string, OpenPr[] | undefined>()
+  const details: string[] = []
+  for (const push of pushes) {
+    const v = await checkPush($, push, prsByRoot, signal)
+    if (v === undefined) continue
+    if (v.status !== 'ok') return v
+    details.push(v.detail)
+  }
+  return details.length > 0 ? { status: 'ok', detail: details.join('; ') } : undefined
+}
+
+// push 1 つ分。push 先のブランチに開いている PR があれば、push するコミットで PR の内容を判定する。
 // 判定するものがなければ undefined。refspec が複数あれば順に判定し、最初のずれで止める
-async function checkPush($: EngineInterface, push: Push, signal: AbortSignal): Promise<Verdict | undefined> {
+async function checkPush($: EngineInterface, push: Push, prsByRoot: Map<string, OpenPr[] | undefined>, signal: AbortSignal): Promise<Verdict | undefined> {
   // 場所がわからなければ、開いている PR があるかもわからないので、PR がないときと同じく判定しない
   let root: string
   try {
@@ -106,12 +121,13 @@ async function checkPush($: EngineInterface, push: Push, signal: AbortSignal): P
   if (remote === undefined) return undefined
   const refs = await pushRefs($, root, push.refs, remote.name, current)
   if (refs.length === 0) return undefined
-  // 開いている PR は 1 回だけ問い合わせ、push 先のリポジトリとブランチで突き合わせる
-  const prs = await openPrs($, root)
+  // 開いている PR を、push 先のリポジトリとブランチで突き合わせる
+  if (!prsByRoot.has(root)) prsByRoot.set(root, await openPrs($, root))
+  const prs = prsByRoot.get(root)
   if (prs === undefined) return undefined
 
   const targets = refs.flatMap(ref => prs.filter(p => p.repo === remote.repo && p.head === ref.dst).map(pr => ({ ref, pr })))
-  // 開いている PR を更新する push の前にコミットを作る・動かすなら、push するコミットがまだわからない
+  // 開いている PR を更新する push の前に、読むだけでない git コマンドがあるなら、push するコミットがまだわからない
   if (targets.length > 0 && push.mover !== undefined) return { status: 'split', mover: push.mover }
 
   const details: string[] = []
@@ -414,33 +430,33 @@ export function parsePrCreate(command: string): PrCreate | undefined {
   return findPrCreate(splitCommand(command), [])
 }
 
-// 区切りを順にたどって gh pr create を探す。cds はそこまでに実行される cd
+// 区切りを順にたどって、最初の gh pr create を探す
 function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undefined {
-  return findCommand(segments, outerCds, (words, cds, mover) => {
+  return collectCommands(segments, outerCds, (words, cds, mover) => {
     if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'create') return undefined
     const args = parseCreateArgs(words.slice(3))
-    if (args.help) return null
+    if (args.help) return undefined
     const pr: PrCreate = { cds, base: args.base, head: args.head }
     return mover === undefined ? pr : { ...pr, mover }
-  })
+  })[0]
 }
 
-// コマンドが git push を実行するなら、その内容を返す。ブランチの削除・dry run・タグだけの push などは対象外
-export function parsePush(command: string): Push | undefined {
-  return findCommand(splitCommand(command), [], (words, cds, mover) => {
+// コマンドが実行する git push を、実行する順にすべて返す。ブランチの削除・dry run・タグだけの push などは含めない
+export function parsePush(command: string): Push[] {
+  return collectCommands(splitCommand(command), [], (words, cds, mover) => {
     const g = parseGit(words, cds)
     if (g === undefined || g.sub !== 'push') return undefined
     // bare リポジトリなど、場所を読み取れない git push は判定しない
-    if (g.here === undefined) return null
+    if (g.here === undefined) return undefined
     const args = parsePushArgs(g.rest)
-    if (args === undefined) return null
+    if (args === undefined) return undefined
     return mover === undefined ? { cds: g.here, ...args } : { cds: g.here, ...args, mover }
   })
 }
 
 // git のコマンドなら、サブコマンドとその引数、実行される場所(cds に全体のオプションの分を足したもの)を返す。
-// -C と --work-tree は cd と同じく場所を変える。--git-dir は、.git を指すならその親へ移り、
-// それ以外(bare リポジトリなど)は場所を読み取れないので here を undefined にする
+// -C は cd と同じく場所を変える(--work-tree は作業ツリーを変えるだけで、リポジトリは今いる場所から探すので変えない)。
+// --git-dir は、.git を指すならその親へ移り、それ以外(bare リポジトリなど)は場所を読み取れないので here を undefined にする
 function parseGit(words: string[], cds: string[]): { sub: string; rest: string[]; here?: string[] } | undefined {
   if (words[0] !== 'git') return undefined
   let here: string[] | undefined = [...cds]
@@ -451,7 +467,7 @@ function parseGit(words: string[], cds: string[]): { sub: string; rest: string[]
     const name = eq < 0 ? w : w.slice(0, eq)
     const takesValue = GIT_VALUE_OPTIONS.has(name)
     const value = !takesValue ? undefined : eq < 0 ? words[i + 1] : w.slice(eq + 1)
-    if (name === '-C' || name === '--work-tree') here?.push(value ?? '')
+    if (name === '-C') here?.push(value ?? '')
     if (name === '--git-dir') {
       const dir = (value ?? '').replace(/\/+$/, '')
       if (dir !== '.git' && !dir.endsWith('/.git')) here = undefined
@@ -464,38 +480,46 @@ function parseGit(words: string[], cds: string[]): { sub: string; rest: string[]
   return here === undefined ? { sub, rest: words.slice(i + 1) } : { sub, rest: words.slice(i + 1), here }
 }
 
-// コミットを作る、またはブランチの指すコミットを動かす git のサブコマンド。
-// これが push や gh pr create より前にあると、実行する前の今は、push・PR に入るコミットがまだわからない
-const HEAD_MOVERS = new Set(['commit', 'merge', 'rebase', 'cherry-pick', 'revert', 'am', 'pull', 'reset', 'checkout', 'switch'])
+// 読むだけの git のサブコマンド。これ以外の git コマンド(push は除く)と gh pr checkout は、
+// コミットを作ったり、ブランチの指すコミットや今のブランチを変えたりしうるので、mover として扱う
+const READ_ONLY_GIT = new Set([
+  'status', 'log', 'diff', 'show', 'fetch', 'rev-parse', 'rev-list', 'ls-files', 'ls-tree', 'ls-remote', 'cat-file',
+  'describe', 'blame', 'grep', 'shortlog', 'merge-base', 'for-each-ref', 'show-ref', 'name-rev', 'check-ignore',
+  'count-objects', 'whatchanged', 'help', 'version',
+])
 
-// 区切りを順にたどり、match が値を返した最初のコマンドを返す。match は、対象外なら undefined、
-// 見つけたが判定しないなら null を返す(後ろのコマンドは続けて探す)。cds はそこまでに実行される cd、
-// mover はそこまでに実行される、コミットを作る・動かす git コマンド(最初のもの)
-function findCommand<T>(
+// 実行する前の今は、その後ろの push・PR に入るコミットがわからなくなるコマンドなら、その名前(`git commit` など)
+function moverOf(words: string[], cds: string[]): string | undefined {
+  if (words[0] === 'gh' && words[1] === 'pr' && words[2] === 'checkout') return 'gh pr checkout'
+  const g = parseGit(words, cds)
+  if (g === undefined || g.sub === 'push' || READ_ONLY_GIT.has(g.sub)) return undefined
+  return `git ${g.sub}`
+}
+
+// 区切りを順にたどり、match が値を返したコマンドを、実行する順にすべて返す。match は、対象外なら undefined を返す。
+// cds はそこまでに実行される cd、mover はそこまでに実行される、読むだけでない git コマンド(最初のもの)
+function collectCommands<T>(
   segments: Segment[],
   outerCds: string[],
-  match: (words: string[], cds: string[], mover: string | undefined) => T | null | undefined,
-  outerMover?: string,
-): T | undefined {
+  match: (words: string[], cds: string[], mover: string | undefined) => T | undefined,
+  state: { mover?: string } = {},
+): T[] {
+  const out: T[] = []
   const cds = [...outerCds]
-  let mover = outerMover
   for (const segment of segments) {
-    // コマンド置換は区切りより先に、サブシェルで実行される。外の cd は引き継ぐが、中の cd は外に漏れない
-    for (const sub of segment.subs) {
-      const found = findCommand(sub, cds, match, mover)
-      if (found !== undefined) return found
-    }
+    // コマンド置換は区切りより先に、サブシェルで実行される。外の cd は引き継ぐが、中の cd は外に漏れない。
+    // 中で作ったコミットはリポジトリに残るので、mover は外にも引き継ぐ
+    for (const sub of segment.subs) out.push(...collectCommands(sub, cds, match, state))
     const words = stripPrefixes(segment.words)
     if (words[0] === 'cd') {
       if (words[1] !== '-') cds.push(words[1] ?? '')
       continue
     }
-    const found = match(words, [...cds], mover)
-    if (found !== undefined && found !== null) return found
-    const g = parseGit(words, cds)
-    if (mover === undefined && g !== undefined && HEAD_MOVERS.has(g.sub)) mover = `git ${g.sub}`
+    const found = match(words, [...cds], state.mover)
+    if (found !== undefined) out.push(found)
+    state.mover ??= moverOf(words, cds)
   }
-  return undefined
+  return out
 }
 
 // git の全体のオプションのうち、値を取るもの
