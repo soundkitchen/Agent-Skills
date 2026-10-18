@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { joinDir, parseJson, parsePrCreate, parsePush, splitCommand } from '../hooks/register.ts'
+import { joinDir, parseJson, parsePrCreate, parsePush, repoOf, splitCommand } from '../hooks/register.ts'
 
 // 区切りごとの単語だけを取り出す(置換の中は含めない)
 const wordsOf = (command: string) => splitCommand(command).map(s => s.words)
@@ -11,11 +11,14 @@ const FEATURE_HEAD = 'f00d42'
 const SESSION_MODEL = 'claude-opus-5-5'
 
 type Model = (prompt: string) => { text: string } | { reason: 'empty-reply' }
-type Pr = { number: number; state: string; baseRefName: string }
+// PR の head のリポジトリは、owner を省略すると origin と同じ o/r
+type Pr = { number: number; state: string; baseRefName: string; headRefName: string; owner?: string }
+const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName: 'fix/foo' }
 
 // git・gh と model を差し替え、Bash の実行は「走った」ことだけを記録する。
-// 今のブランチは fix/foo で、prs はブランチごとの PR(gh pr view が返すもの)
-function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string, string>; prs?: Record<string, Pr>; model: Model }) {
+// 今のブランチは fix/foo(upstream は origin/fix/foo)。remote は origin(o/r)と fork(me/r)。
+// prs は GitHub にある PR で、gh pr list --state open は開いているものだけを返す
+function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string, string>; prs?: Pr[]; model: Model }) {
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
   const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[] }
 
@@ -29,8 +32,15 @@ function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string
     const fail = { value: { exitCode: 1, stdout: '', stderr: 'no', isStdoutTruncated: false, isStderrTruncated: false } }
     if (cmd === 'gh') {
       calls.gh.push(args.join(' '))
-      const pr = args[0] === 'pr' && args[1] === 'view' ? opts.prs?.[args[2]!] : undefined
-      return pr !== undefined ? ok(JSON.stringify(pr)) : fail
+      if (args[0] !== 'pr' || args[1] !== 'list') return fail
+      const open = (opts.prs ?? []).filter(pr => pr.state === 'OPEN').map(pr => ({
+        number: pr.number,
+        baseRefName: pr.baseRefName,
+        headRefName: pr.headRefName,
+        headRepository: { name: 'r' },
+        headRepositoryOwner: { login: pr.owner ?? 'o' },
+      }))
+      return ok(JSON.stringify(open))
     }
     if (cmd !== 'git') return fail
     const sub = args.join(' ')
@@ -43,6 +53,10 @@ function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string
     }
     if (sub === 'rev-parse HEAD') return ok(`${HEAD}\n`)
     if (sub === 'symbolic-ref --short --quiet HEAD') return ok('fix/foo\n')
+    if (sub === 'config branch.fix/foo.remote') return ok('origin\n')
+    if (sub === 'config branch.fix/foo.merge') return ok('refs/heads/fix/foo\n')
+    if (sub === 'remote get-url --push origin') return ok('git@github.com:o/r.git\n')
+    if (sub === 'remote get-url --push fork') return ok('https://github.com/me/r.git\n')
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return ok(`${HEAD}\n`)
     if (sub === 'rev-parse --verify --quiet fix/foo^{commit}') return ok(`${HEAD}\n`)
     if (sub === 'symbolic-ref --short refs/remotes/origin/HEAD') return ok('origin/main\n')
@@ -256,18 +270,18 @@ describe('docs-sync', () => {
 
 describe('docs-sync on git push', () => {
   test('blocks a push to a branch with an open PR when the docs drift', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'OPEN', baseRefName: 'main' } }, model: DRIFT })
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push' })
     expect(r.deny).toContain('docs-sync: the push was blocked')
     expect(r.deny).toContain('README.md: says --fast but the CLI now takes --quick')
     expect(r.deny).toContain('Commit the fixes and push again')
-    expect(calls.gh).toEqual(['pr view fix/foo --json number,state,baseRefName'])
+    expect(calls.gh).toEqual(['pr list --state open --limit 1000 --json number,baseRefName,headRefName,headRepository,headRepositoryOwner'])
     expect(calls.git).toContain(`diff --no-color origin/main...${HEAD}`)
     expect(calls.ran).toEqual([])
   })
 
   test('lets the push run and tells Claude when the docs match', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'OPEN', baseRefName: 'main' } }, model: OK })
+    const calls = world(on, { prs: [OPEN_PR], model: OK })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push origin HEAD' })
     expect(calls.ran).toEqual(['git push origin HEAD'])
     expect(r.context?.[0]).toContain('docs-sync: the documentation check ran before this git push')
@@ -275,15 +289,29 @@ describe('docs-sync on git push', () => {
   })
 
   test('does not check a push to a branch without an open PR', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'MERGED', baseRefName: 'main' } }, model: DRIFT })
+    const calls = world(on, { prs: [{ ...OPEN_PR, state: 'MERGED' }, { ...OPEN_PR, number: 6, headRefName: 'other' }], model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push -u origin fix/foo' })
     expect(calls.ran).toEqual(['git push -u origin fix/foo'])
     expect(calls.model).toBe(0)
     expect(r.context).toBe(undefined)
   })
 
+  test('does not check a push to another remote than the repository the PR comes from', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
+    await $.tool.call({ tool: 'Bash', command: 'git push fork' })
+    expect(calls.ran).toEqual(['git push fork'])
+    expect(calls.model).toBe(0)
+  })
+
+  test('checks a push to a fork when the PR comes from that fork', async ($, on) => {
+    const calls = world(on, { prs: [{ ...OPEN_PR, owner: 'me' }], model: DRIFT })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push fork' })
+    expect(r.deny).toContain('the push was blocked')
+    expect(calls.ran).toEqual([])
+  })
+
   test('does not check the push again for a commit that passed with gh pr create', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'OPEN', baseRefName: 'main' } }, model: OK })
+    const calls = world(on, { prs: [OPEN_PR], model: OK })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     await $.tool.call({ tool: 'Bash', command: 'git push' })
     expect(calls.model).toBe(1)
@@ -291,7 +319,7 @@ describe('docs-sync on git push', () => {
   })
 
   test('checks a push in the same command as gh pr create only once, as gh pr create', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'OPEN', baseRefName: 'main' } }, model: OK })
+    const calls = world(on, { prs: [OPEN_PR], model: OK })
     const r = await $.tool.call({ tool: 'Bash', command: 'git push -u origin fix/foo && gh pr create --fill' })
     expect(calls.gh).toEqual([])
     expect(calls.model).toBe(1)
@@ -299,7 +327,7 @@ describe('docs-sync on git push', () => {
   })
 
   test('does not ask the user when the push runs outside a repository it can find', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'OPEN', baseRefName: 'main' } }, model: DRIFT })
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'cd "$DIR" && git push' })
     expect(r.deny).toBe(undefined)
     expect(calls.ran.length).toBe(1)
@@ -307,12 +335,19 @@ describe('docs-sync on git push', () => {
   })
 
   test('does not check a branch deletion or a dry run', async ($, on) => {
-    const calls = world(on, { prs: { 'fix/foo': { number: 5, state: 'OPEN', baseRefName: 'main' } }, model: DRIFT })
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
     for (const command of ['git push origin --delete fix/foo', 'git push origin :fix/foo', 'git push -n']) {
       await $.tool.call({ tool: 'Bash', command })
     }
     expect(calls.ran.length).toBe(3)
     expect(calls.model).toBe(0)
+  })
+
+  test('checks a push that comes after a push it does not check', async ($, on) => {
+    const calls = world(on, { prs: [OPEN_PR], model: DRIFT })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push origin --delete old && git push origin fix/foo' })
+    expect(r.deny).toContain('the push was blocked')
+    expect(calls.ran).toEqual([])
   })
 })
 
@@ -378,14 +413,19 @@ describe('parsePrCreate', () => {
 describe('parsePush', () => {
   test('reads the refspecs after the remote', async () => {
     expect(parsePush('git push')).toEqual({ cds: [], refs: [] })
-    expect(parsePush('git push -u origin fix/foo')).toEqual({ cds: [], refs: [{ src: 'fix/foo' }] })
-    expect(parsePush('git push origin HEAD:fix/foo +a:b')).toEqual({ cds: [], refs: [{ src: 'HEAD', dst: 'fix/foo' }, { src: '+a', dst: 'b' }] })
-    expect(parsePush('git push -o ci.skip --repo=origin origin x')).toEqual({ cds: [], refs: [{ src: 'x' }] })
-    expect(parsePush('git push --tags origin main')).toEqual({ cds: [], refs: [{ src: 'main' }] })
+    expect(parsePush('git push -u origin fix/foo')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'fix/foo' }] })
+    expect(parsePush('git push origin HEAD:fix/foo +a:b')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'HEAD', dst: 'fix/foo' }, { src: '+a', dst: 'b' }] })
+    expect(parsePush('git push -o ci.skip origin x')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'x' }] })
+    expect(parsePush('git push --repo=fork')).toEqual({ cds: [], remote: 'fork', refs: [] })
+    expect(parsePush('git push --tags origin main')).toEqual({ cds: [], remote: 'origin', refs: [{ src: 'main' }] })
   })
 
-  test('applies cd and git -C', async () => {
+  test('applies cd and the git options that change the place', async () => {
     expect(parsePush('cd a && git -C b -c x=y push')).toEqual({ cds: ['a', 'b'], refs: [] })
+    expect(parsePush('git --work-tree=/other --namespace n push')).toEqual({ cds: ['/other'], refs: [] })
+    expect(parsePush('git --git-dir .git push')).toEqual({ cds: [], refs: [] })
+    expect(parsePush('git --git-dir=../repo/.git push')).toEqual({ cds: ['../repo'], refs: [] })
+    expect(parsePush('git --git-dir=/srv/bare.git push')).toBe(undefined)
   })
 
   test('returns nothing for pushes that are not checked', async () => {
@@ -397,6 +437,15 @@ describe('parsePush', () => {
   test('ignores git push inside quotes and other git commands', async () => {
     expect(parsePush('git commit -m "then git push"')).toBe(undefined)
     expect(parsePush('git pull')).toBe(undefined)
+  })
+})
+
+describe('repoOf', () => {
+  test('reads owner/name from SSH and HTTPS remote URLs', async () => {
+    expect(repoOf('git@github.com:Owner/Repo.git')).toBe('owner/repo')
+    expect(repoOf('https://github.com/owner/repo')).toBe('owner/repo')
+    expect(repoOf('ssh://git@github.com/owner/repo.git/')).toBe('owner/repo')
+    expect(repoOf('repo')).toBe(undefined)
   })
 })
 

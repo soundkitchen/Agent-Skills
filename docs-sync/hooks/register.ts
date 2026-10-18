@@ -16,8 +16,8 @@ type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: F
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
 export type PrCreate = { cds: string[]; base?: string; head?: string }
-// コマンドから読み取った git push の内容。refs が空なら、今のブランチを push する
-export type Push = { cds: string[]; refs: PushRef[] }
+// コマンドから読み取った git push の内容。remote は push 先の指定(省略時は git の既定)、refs が空なら今のブランチを push する
+export type Push = { cds: string[]; remote?: string; refs: PushRef[] }
 // push する refspec。src は push するコミット、dst は push 先のブランチ(省略時は src と同じ)
 export type PushRef = { src: string; dst?: string }
 
@@ -97,17 +97,26 @@ async function checkPush($: EngineInterface, push: Push, signal: AbortSignal): P
   } catch {
     return undefined
   }
+  const current = await git($, ['symbolic-ref', '--short', '--quiet', 'HEAD'], root)
+  const remote = await pushRemote($, root, push.remote, current)
+  if (remote === undefined) return undefined
+  const refs = await pushRefs($, root, push.refs, remote.name, current)
+  if (refs.length === 0) return undefined
+  // 開いている PR は 1 回だけ問い合わせ、push 先のリポジトリとブランチで突き合わせる
+  const prs = await openPrs($, root)
+  if (prs === undefined) return undefined
+
   const details: string[] = []
-  for (const ref of await pushRefs($, root, push.refs)) {
-    const pr = await openPr($, root, ref.dst)
-    if (pr === undefined) continue
-    const head = await firstCommit($, root, [ref.src])
-    if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
-    const base = await resolveBase($, root, pr.base)
-    if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base} of PR #${pr.number}`)
-    const v = await check($, root, base, head, signal)
-    if (v.status === 'drift') return v
-    details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
+  for (const ref of refs) {
+    for (const pr of prs.filter(p => p.repo === remote.repo && p.head === ref.dst)) {
+      const head = await firstCommit($, root, [ref.src])
+      if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
+      const base = await resolveBase($, root, pr.base)
+      if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base} of PR #${pr.number}`)
+      const v = await check($, root, base, head, signal)
+      if (v.status === 'drift') return v
+      details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
+    }
   }
   return details.length > 0 ? { status: 'ok', detail: details.join('; ') } : undefined
 }
@@ -233,14 +242,38 @@ async function firstCommit($: EngineInterface, root: string, refs: string[]): Pr
   return undefined
 }
 
+// push 先の remote と、それが指す GitHub のリポジトリ(owner/name、小文字)。
+// remote の指定がなければ、git と同じく pushRemote・pushDefault・upstream の remote・origin の順に決める。
+// リポジトリを URL から読み取れなければ undefined
+async function pushRemote($: EngineInterface, root: string, given: string | undefined, current: string | undefined): Promise<{ name?: string; repo: string } | undefined> {
+  let name = given
+  if (name === undefined && current !== undefined) {
+    name = (await git($, ['config', `branch.${current}.pushRemote`], root)) ?? (await git($, ['config', 'remote.pushDefault'], root)) ?? (await git($, ['config', `branch.${current}.remote`], root))
+  }
+  name ??= 'origin'
+  // remote の名前ではなく URL を直接指定した push
+  const isUrl = name.includes(':') || name.includes('/')
+  const url = isUrl ? name : await git($, ['remote', 'get-url', '--push', name], root)
+  const repo = url === undefined ? undefined : repoOf(url)
+  if (repo === undefined) return undefined
+  return { name: isUrl ? undefined : name, repo }
+}
+
+// remote の URL(git@host:owner/name.git・https://host/owner/name など)から owner/name を取り出す
+export function repoOf(url: string): string | undefined {
+  const m = /[:/]([^/:]+)\/([^/]+?)(?:\.git)?\/?$/.exec(url)
+  return m === null ? undefined : `${m[1]}/${m[2]}`.toLowerCase()
+}
+
 // push する refspec を、push するコミット(src)と push 先のブランチ名(dst)にそろえる。
-// refspec がなければ今のブランチを、その upstream(なければ同じ名前)へ push する
-async function pushRefs($: EngineInterface, root: string, refs: PushRef[]): Promise<Required<PushRef>[]> {
-  const current = await git($, ['symbolic-ref', '--short', '--quiet', 'HEAD'], root)
+// refspec がなければ今のブランチを push する。push 先が upstream の remote ならその upstream のブランチへ、
+// ほかの remote なら同じ名前のブランチへ
+async function pushRefs($: EngineInterface, root: string, refs: PushRef[], remote: string | undefined, current: string | undefined): Promise<Required<PushRef>[]> {
   if (refs.length === 0) {
     // detached HEAD から refspec なしで push することはできないので、判定するものはない
     if (current === undefined) return []
-    const merge = await git($, ['config', `branch.${current}.merge`], root)
+    const upstreamRemote = await git($, ['config', `branch.${current}.remote`], root)
+    const merge = remote !== undefined && remote === upstreamRemote ? await git($, ['config', `branch.${current}.merge`], root) : undefined
     return [{ src: 'HEAD', dst: merge?.replace(/^refs\/heads\//, '') ?? current }]
   }
   const out: Required<PushRef>[] = []
@@ -258,14 +291,26 @@ async function pushRefs($: EngineInterface, root: string, refs: PushRef[]): Prom
   return out
 }
 
-// ブランチに開いている PR があれば、その番号と base を返す。PR がない、または gh で確かめられないときは undefined
-async function openPr($: EngineInterface, root: string, branch: string): Promise<{ number: number; base: string } | undefined> {
+type OpenPr = { number: number; base: string; head: string; repo: string }
+const GH_TIMEOUT_MS = 15_000
+
+// 開いている PR の一覧。repo は head のブランチがあるリポジトリ(owner/name、小文字)。gh で確かめられなければ undefined
+async function openPrs($: EngineInterface, root: string): Promise<OpenPr[] | undefined> {
   try {
-    const r = await $.process.run(['gh', 'pr', 'view', branch, '--json', 'number,state,baseRefName'], { cwd: root })
-    if (r.exitCode !== 0) return undefined
-    const pr = parseJson(r.stdout) as { number?: unknown; state?: unknown; baseRefName?: unknown } | undefined
-    if (pr?.state !== 'OPEN' || typeof pr.number !== 'number' || typeof pr.baseRefName !== 'string') return undefined
-    return { number: pr.number, base: pr.baseRefName }
+    const r = await $.process.run(
+      ['gh', 'pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,baseRefName,headRefName,headRepository,headRepositoryOwner'],
+      { cwd: root, timeoutMs: GH_TIMEOUT_MS },
+    )
+    if (r.exitCode !== 0 || r.isStdoutTruncated) return undefined
+    const list = parseJson(r.stdout)
+    if (!Array.isArray(list)) return undefined
+    return list.flatMap(p => {
+      const owner = p?.headRepositoryOwner?.login
+      const name = p?.headRepository?.name
+      if (typeof p?.number !== 'number' || typeof p.baseRefName !== 'string' || typeof p.headRefName !== 'string') return []
+      if (typeof owner !== 'string' || typeof name !== 'string') return []
+      return [{ number: p.number, base: p.baseRefName, head: p.headRefName, repo: `${owner}/${name}`.toLowerCase() }]
+    })
   } catch {
     return undefined
   }
@@ -377,21 +422,32 @@ function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undef
 export function parsePush(command: string): Push | undefined {
   return findCommand(splitCommand(command), [], (words, cds) => {
     if (words[0] !== 'git') return undefined
-    // git の全体のオプション。-C は cd と同じく場所を変える
+    // git の全体のオプション。-C と --work-tree は cd と同じく場所を変える。
+    // --git-dir は、.git を指すならその親へ移る。それ以外(bare リポジトリなど)は判定しない
     const here = [...cds]
     let i = 1
     while (i < words.length && words[i]!.startsWith('-')) {
-      if (words[i] === '-C') here.push(words[i + 1] ?? '')
-      i += words[i] === '-C' || words[i] === '-c' ? 2 : 1
+      const w = words[i]!
+      const eq = w.startsWith('--') ? w.indexOf('=') : -1
+      const name = eq < 0 ? w : w.slice(0, eq)
+      const takesValue = GIT_VALUE_OPTIONS.has(name)
+      const value = !takesValue ? undefined : eq < 0 ? words[i + 1] : w.slice(eq + 1)
+      if (name === '-C' || name === '--work-tree') here.push(value ?? '')
+      if (name === '--git-dir') {
+        const dir = (value ?? '').replace(/\/+$/, '')
+        if (dir !== '.git' && !dir.endsWith('/.git')) return null
+        if (dir !== '.git') here.push(dir.slice(0, -'/.git'.length) || '/')
+      }
+      i += takesValue && eq < 0 ? 2 : 1
     }
     if (words[i] !== 'push') return undefined
-    const refs = parsePushArgs(words.slice(i + 1))
-    return refs === undefined ? null : { cds: here, refs }
+    const args = parsePushArgs(words.slice(i + 1))
+    return args === undefined ? null : { cds: here, ...args }
   })
 }
 
 // 区切りを順にたどり、match が値を返した最初のコマンドを返す。match は、対象外なら undefined、
-// 見つけたが判定しないなら null を返す。cds はそこまでに実行される cd
+// 見つけたが判定しないなら null を返す(後ろのコマンドは続けて探す)。cds はそこまでに実行される cd
 function findCommand<T>(segments: Segment[], outerCds: string[], match: (words: string[], cds: string[]) => T | null | undefined): T | undefined {
   const cds = [...outerCds]
   for (const segment of segments) {
@@ -406,20 +462,22 @@ function findCommand<T>(segments: Segment[], outerCds: string[], match: (words: 
       continue
     }
     const found = match(words, [...cds])
-    if (found === null) return undefined
-    if (found !== undefined) return found
+    if (found !== undefined && found !== null) return found
   }
   return undefined
 }
 
+// git の全体のオプションのうち、値を取るもの
+const GIT_VALUE_OPTIONS = new Set(['-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix'])
 // git push のうち、値を取るオプション(--opt=value の形でないとき、次の単語が値)
 const PUSH_VALUE_FLAGS = new Set(['--repo', '--push-option', '--receive-pack', '--exec'])
 // これがあれば判定しない。削除・dry run・ヘルプ・すべての ref の push
 const PUSH_SKIP_FLAGS = new Set(['--delete', '--dry-run', '--help', '--all', '--branches', '--mirror', '--prune'])
 
-// git push の引数から refspec を読む。判定しない push なら undefined
-function parsePushArgs(args: string[]): PushRef[] | undefined {
+// git push の引数から push 先と refspec を読む。判定しない push なら undefined
+function parsePushArgs(args: string[]): { remote?: string; refs: PushRef[] } | undefined {
   const positional: string[] = []
+  let repo: string | undefined
   let tags = false
   for (let i = 0; i < args.length; i++) {
     const a = args[i]!
@@ -431,7 +489,10 @@ function parsePushArgs(args: string[]): PushRef[] | undefined {
       const name = a.includes('=') ? a.slice(0, a.indexOf('=')) : a
       if (PUSH_SKIP_FLAGS.has(name)) return undefined
       if (name === '--tags') tags = true
-      if (PUSH_VALUE_FLAGS.has(name) && !a.includes('=')) i += 1
+      if (PUSH_VALUE_FLAGS.has(name)) {
+        const v = a.includes('=') ? a.slice(a.indexOf('=') + 1) : args[++i]
+        if (name === '--repo') repo = v
+      }
     } else if (a.startsWith('-') && a.length > 1) {
       // `-uf` のような短いオプションの連結。-d・-n・-h は判定しない、-o は値を取る
       for (let k = 1; k < a.length; k++) {
@@ -453,7 +514,8 @@ function parsePushArgs(args: string[]): PushRef[] | undefined {
   })
   // refspec のない --tags は、タグだけを push する
   if (refs.length === 0 && tags) return undefined
-  return refs
+  const remote = positional[0] ?? repo
+  return remote === undefined ? { refs } : { remote, refs }
 }
 
 // 先頭の環境変数の指定(NAME=value)と、env・command・time などの前置きを飛ばす
