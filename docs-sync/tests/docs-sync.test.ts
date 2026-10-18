@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { parseJson, parsePrCreate, splitCommand } from '../hooks/register.ts'
+import { joinDir, parseJson, parsePrCreate, splitCommand } from '../hooks/register.ts'
 
 // 区切りごとの単語だけを取り出す(置換の中は含めない)
 const wordsOf = (command: string) => splitCommand(command).map(s => s.words)
@@ -13,12 +13,12 @@ const SESSION_MODEL = 'claude-opus-5-5'
 type Model = (prompt: string) => { text: string } | { reason: 'empty-reply' }
 
 // git と model を差し替え、Bash の実行は「走った」ことだけを記録する
-function world(on: On, opts: { diff?: string; docs?: Record<string, string>; model: Model }) {
+function world(on: On, opts: { cwd?: string; diff?: string; docs?: Record<string, string>; model: Model }) {
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
   const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], cwds: [] as string[] }
 
   mock.store(on)
-  on('session.cwd', async () => ({ value: ROOT }))
+  on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
   on('session.model', async () => ({ value: SESSION_MODEL }))
 
   on('process.run', async ($, e) => {
@@ -161,6 +161,32 @@ describe('docs-sync', () => {
     expect(calls.cwds).toEqual([`${ROOT}/../other`])
   })
 
+  test('treats a Windows drive path after cd as absolute', async ($, on) => {
+    const calls = world(on, { cwd: 'D:\\works\\hogehoge', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'cd D:/works/hogehoge && gh pr create --base main --fill' })
+    expect(calls.cwds).toEqual(['D:/works/hogehoge'])
+    expect(calls.ran).toHaveLength(1)
+  })
+
+  test('follows a chain of cd on Windows, decided by the session cwd', async ($, on) => {
+    const calls = world(on, { cwd: 'D:\\works\\a', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'cd /usr/local && cd D:/repo && cd sub && gh pr create --fill' })
+    expect(calls.cwds).toEqual(['D:/repo/sub'])
+  })
+
+  test('turns a Git Bash /d/... path after cd into a drive path', async ($, on) => {
+    const calls = world(on, { cwd: 'C:\\Users\\me', model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'cd /d/works/repo && gh pr create --fill' })
+    expect(calls.cwds).toEqual(['D:/works/repo'])
+  })
+
+  test('resolves cd ~ on Windows with HOME', async ($, on) => {
+    const calls = world(on, { cwd: 'D:\\works\\a', model: OK })
+    mock.env(on, { HOME: 'C:\\Users\\me' })
+    await $.tool.call({ tool: 'Bash', command: 'cd ~/repo && gh pr create --fill' })
+    expect(calls.cwds).toEqual(['C:/Users/me/repo'])
+  })
+
   test('checks the branch given with --head instead of HEAD', async ($, on) => {
     const calls = world(on, { model: OK })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --head feature/x --fill' })
@@ -282,6 +308,30 @@ describe('splitCommand', () => {
 
   test('skips heredoc bodies', async () => {
     expect(wordsOf('cat <<-EOF > x\n\tgh pr create\n\tEOF\nnext')).toEqual([['cat', '>', 'x'], ['next']])
+  })
+})
+
+describe('joinDir', () => {
+  test('joins a relative path and keeps a POSIX absolute path', async () => {
+    expect(joinDir('/repo', '../other', false)).toBe('/repo/../other')
+    expect(joinDir('/repo', '/d/works', false)).toBe('/d/works')
+    expect(joinDir('/repo', 'D:', false)).toBe('/repo/D:')
+  })
+
+  test('treats drive paths as absolute on Windows, with / as the separator', async () => {
+    expect(joinDir('D:\\works\\a', 'E:/b', true)).toBe('E:/b')
+    expect(joinDir('D:\\works\\a', 'E:\\b', true)).toBe('E:/b')
+    expect(joinDir('D:\\works\\a', 'E:', true)).toBe('E:/')
+    expect(joinDir('D:\\works\\a', 'E:b', true)).toBe('E:b')
+    expect(joinDir('D:\\works\\a', 'sub', true)).toBe('D:/works/a/sub')
+    expect(joinDir('D:\\', 'sub', true)).toBe('D:/sub')
+  })
+
+  test('turns Git Bash /d/... and Cygwin /cygdrive/d/... into drive paths on Windows', async () => {
+    expect(joinDir('C:\\Users\\me', '/d/works/a', true)).toBe('D:/works/a')
+    expect(joinDir('C:\\Users\\me', '/d', true)).toBe('D:/')
+    expect(joinDir('C:\\Users\\me', '/cygdrive/d/works/a', true)).toBe('D:/works/a')
+    expect(joinDir('C:\\Users\\me', '/usr/bin', true)).toBe('/usr/bin')
   })
 })
 
