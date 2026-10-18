@@ -7,9 +7,9 @@ skill と違い、呼び出す必要はない。インストールしておけ�
 ## 前提
 
 - Claude Code v2.1.287 以降(mods が使えるバージョン)
-- PR を作るリポジトリが git 管理で、`origin` に base ブランチがあること(`origin/main` など)
+- PR を作るリポジトリが git 管理で、PR を出す先のリポジトリを指す remote に base ブランチがあること(ふつうは `origin/main`、fork の構成なら `upstream/main` など)
 - PR の作成と push を Claude に頼むこと。docs-sync が見るのは、Claude が Bash ツールで実行する `gh pr create` と `git push` だけ
-- PR を作った後の push を判定するには、[GitHub CLI](https://cli.github.com/)(`gh`)がインストール・認証済みであること(push 先のブランチに開いている PR があるかを確かめるため)
+- [GitHub CLI](https://cli.github.com/)(`gh`)がインストール・認証済みであること。PR を作った後の push を判定するとき(push 先のブランチに開いている PR があるかを確かめる)と、`gh pr create` のとき(PR を出す先のリポジトリと既定のブランチを確かめる)に使う。`gh` がないと、PR を作った後の push は判定せず、`gh pr create` では `origin` の base と比べる(fork の構成では、fork 側の古い base と比べることになる)
 
 ## インストール
 
