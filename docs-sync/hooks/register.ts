@@ -8,15 +8,35 @@ const PROMPT_BUDGET = 300_000
 // 判定の対象にするドキュメント
 const DOC_FILE = /\.mdx?$/
 
-const ASK_CONTINUE = 'このまま PR を作成する'
 const ASK_CANCEL = '中止する'
 
 type Finding = { doc: string; issue: string; fix: string }
-// ok の note は、通ったことと理由を Claude に伝える文
-type Verdict = { status: 'ok'; note: string } | { status: 'drift'; findings: Finding[] }
+// ok の detail は、通した理由を Claude に伝える文
+type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: Finding[] }
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
 export type PrCreate = { cds: string[]; base?: string; head?: string }
+// コマンドから読み取った git push の内容。refs が空なら、今のブランチを push する
+export type Push = { cds: string[]; refs: PushRef[] }
+// push する refspec。src は push するコミット、dst は push 先のブランチ(省略時は src と同じ)
+export type PushRef = { src: string; dst?: string }
+
+// 割り込む操作ごとの言い回し。command・blocked・retry は Claude に、ask・proceed はユーザーに見せる
+type Action = { command: string; blocked: string; retry: string; ask: string; proceed: string }
+const PR_CREATE: Action = {
+  command: 'gh pr create',
+  blocked: 'PR creation was blocked',
+  retry: 'Commit the fixes, push them, and run gh pr create again.',
+  ask: 'このまま PR を作成しますか?',
+  proceed: 'このまま PR を作成する',
+}
+const PUSH: Action = {
+  command: 'git push',
+  blocked: 'the push was blocked',
+  retry: 'Commit the fixes and push again. The push sends them together with the commits it was going to send.',
+  ask: 'このまま push しますか?',
+  proceed: 'このまま push する',
+}
 
 // 判定できなかったことを表す。ユーザーに続けるか聞く
 class CheckFailed extends Error {}
@@ -24,51 +44,98 @@ class CheckFailed extends Error {}
 export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
     const pr = parsePrCreate(e.command)
-    if (pr === undefined) return next(e)
+    // gh pr create があれば、同じコマンドの git push は PR を作る前のものなので、gh pr create として判定する
+    const push = pr === undefined ? parsePush(e.command) : undefined
+    if (pr === undefined && push === undefined) return next(e)
+    const action = pr !== undefined ? PR_CREATE : PUSH
 
-    let verdict: Verdict
+    let verdict: Verdict | undefined
     try {
-      verdict = await check($, pr, next.signal)
+      verdict = pr !== undefined ? await checkPrCreate($, pr, next.signal) : await checkPush($, push!, next.signal)
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
-      if (!(await confirmAfterFailure($, reason))) return { deny: failureDeny(reason) }
-      return withNote(await next(e), failureNote(reason))
+      if (!(await confirmAfterFailure($, action, reason))) return { deny: failureDeny(action, reason) }
+      return withNote(await next(e), failureNote(action, reason))
     }
 
-    if (verdict.status === 'ok') return withNote(await next(e), verdict.note)
-    return { deny: driftDeny(verdict.findings) }
+    // 開いている PR がないブランチへの push は、判定しない(PR を作るときに判定する)
+    if (verdict === undefined) return next(e)
+    if (verdict.status === 'ok') return withNote(await next(e), passNote(action, verdict.detail))
+    return { deny: driftDeny(action, verdict.findings) }
   }).catch(async ($, e, next) => {
     // hook 自体が落ちたときは通さない側に倒す
-    return { deny: failureDeny(`the docs-sync hook failed (${next.error.kind})`) }
+    return { deny: failureDeny(actionOf(e.command), `the docs-sync hook failed (${next.error.kind})`) }
   })
 }
 
-// PR に入る内容(base...head の差分)とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる
-async function check($: EngineInterface, pr: PrCreate, signal: AbortSignal): Promise<Verdict> {
-  const cwd = await resolveCwd($, pr.cds)
-  const root = await git($, ['rev-parse', '--show-toplevel'], cwd)
-  if (root === undefined) throw new CheckFailed(`not inside a git repository (${cwd})`)
+// hook が落ちたときの言い回しに使う。解析でも落ちるなら、PR の作成として扱う
+function actionOf(command: string): Action {
+  try {
+    return parsePrCreate(command) === undefined && parsePush(command) !== undefined ? PUSH : PR_CREATE
+  } catch {
+    return PR_CREATE
+  }
+}
 
+// gh pr create で作る PR の内容(base...head の差分)とドキュメントを比べる
+async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSignal): Promise<Verdict> {
+  const root = await resolveRoot($, pr.cds)
   const head = await resolveHead($, root, pr.head)
   if (head === undefined) throw new CheckFailed(`could not resolve the head ${pr.head ?? 'HEAD'}`)
-
   const base = await resolveBase($, root, pr.base)
   if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base ?? ''}`.trim())
+  return check($, root, base, head, signal)
+}
 
+// push 先のブランチに開いている PR があれば、push するコミットで PR の内容を判定する。
+// 判定するものがなければ undefined。refspec が複数あれば順に判定し、最初のずれで止める
+async function checkPush($: EngineInterface, push: Push, signal: AbortSignal): Promise<Verdict | undefined> {
+  // 場所がわからなければ、開いている PR があるかもわからないので、PR がないときと同じく判定しない
+  let root: string
+  try {
+    root = await resolveRoot($, push.cds)
+  } catch {
+    return undefined
+  }
+  const details: string[] = []
+  for (const ref of await pushRefs($, root, push.refs)) {
+    const pr = await openPr($, root, ref.dst)
+    if (pr === undefined) continue
+    const head = await firstCommit($, root, [ref.src])
+    if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
+    const base = await resolveBase($, root, pr.base)
+    if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base} of PR #${pr.number}`)
+    const v = await check($, root, base, head, signal)
+    if (v.status === 'drift') return v
+    details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
+  }
+  return details.length > 0 ? { status: 'ok', detail: details.join('; ') } : undefined
+}
+
+// コマンド内の cd をたどった先の、git リポジトリのルート
+async function resolveRoot($: EngineInterface, cds: string[]): Promise<string> {
+  const cwd = await resolveCwd($, cds)
+  const root = await git($, ['rev-parse', '--show-toplevel'], cwd)
+  if (root === undefined) throw new CheckFailed(`not inside a git repository (${cwd})`)
+  return root
+}
+
+// base...head の差分とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる
+async function check($: EngineInterface, root: string, base: string, head: string, signal: AbortSignal): Promise<Verdict> {
   // 同じ base で最後に通ったコミットと同じなら判定し直さない
   const cacheKey = `pass:${root}:${base}`
   const short = head.slice(0, 7)
   if ((await $.store.get(cacheKey)) === head) {
-    return { status: 'ok', note: passNote(`commit ${short} already passed the check against ${base}, so it was not checked again`) }
+    return { status: 'ok', detail: `commit ${short} already passed the check against ${base}, so it was not checked again` }
   }
 
   const diff = await git($, ['diff', '--no-color', `${base}...${head}`], root)
   if (diff === undefined) throw new CheckFailed(`git diff ${base}...${head} failed`)
-  if (diff.trim() === '') return { status: 'ok', note: passNote(`there is no diff between ${base} and ${short}, so there was nothing to check`) }
+  if (diff.trim() === '') return { status: 'ok', detail: `there is no diff between ${base} and ${short}, so there was nothing to check` }
   if (diff.length > PROMPT_BUDGET) throw new CheckFailed('the diff is too large to check')
 
   const docs = await readDocs($, root, head)
-  if (docs.length === 0) return { status: 'ok', note: passNote(`the repository has no Markdown documents at ${short}, so there was nothing to check`) }
+  if (docs.length === 0) return { status: 'ok', detail: `the repository has no Markdown documents at ${short}, so there was nothing to check` }
 
   // 実装を読む判定なので、作業中のセッションと同じモデルで見る
   const model = await $.session.model()
@@ -82,10 +149,10 @@ async function check($: EngineInterface, pr: PrCreate, signal: AbortSignal): Pro
     await $.store.set(cacheKey, head)
   } catch {}
   const checked = `checked the diff ${base}...${short} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
-  return { status: 'ok', note: passNote(checked) }
+  return { status: 'ok', detail: checked }
 }
 
-// 通した gh pr create の結果に、Claude だけが読む一文を添える
+// 通したコマンドの結果に、Claude だけが読む一文を添える
 function withNote(r: ToolCallResult<'Bash'>, note: string): ToolCallResult<'Bash'> {
   if (r.deny !== undefined) return r
   return { ...r, context: [...(r.context ?? []), note] }
@@ -166,6 +233,44 @@ async function firstCommit($: EngineInterface, root: string, refs: string[]): Pr
   return undefined
 }
 
+// push する refspec を、push するコミット(src)と push 先のブランチ名(dst)にそろえる。
+// refspec がなければ今のブランチを、その upstream(なければ同じ名前)へ push する
+async function pushRefs($: EngineInterface, root: string, refs: PushRef[]): Promise<Required<PushRef>[]> {
+  const current = await git($, ['symbolic-ref', '--short', '--quiet', 'HEAD'], root)
+  if (refs.length === 0) {
+    // detached HEAD から refspec なしで push することはできないので、判定するものはない
+    if (current === undefined) return []
+    const merge = await git($, ['config', `branch.${current}.merge`], root)
+    return [{ src: 'HEAD', dst: merge?.replace(/^refs\/heads\//, '') ?? current }]
+  }
+  const out: Required<PushRef>[] = []
+  for (const ref of refs) {
+    const src = ref.src.replace(/^\+/, '')
+    // `:branch` はブランチの削除なので判定しない
+    if (src === '') continue
+    let dst = ref.dst ?? src
+    if (dst === 'HEAD') {
+      if (current === undefined) continue
+      dst = current
+    }
+    out.push({ src, dst: dst.replace(/^refs\/heads\//, '') })
+  }
+  return out
+}
+
+// ブランチに開いている PR があれば、その番号と base を返す。PR がない、または gh で確かめられないときは undefined
+async function openPr($: EngineInterface, root: string, branch: string): Promise<{ number: number; base: string } | undefined> {
+  try {
+    const r = await $.process.run(['gh', 'pr', 'view', branch, '--json', 'number,state,baseRefName'], { cwd: root })
+    if (r.exitCode !== 0) return undefined
+    const pr = parseJson(r.stdout) as { number?: unknown; state?: unknown; baseRefName?: unknown } | undefined
+    if (pr?.state !== 'OPEN' || typeof pr.number !== 'number' || typeof pr.baseRefName !== 'string') return undefined
+    return { number: pr.number, base: pr.baseRefName }
+  } catch {
+    return undefined
+  }
+}
+
 // head のコミット時点のドキュメントを読む。PR に入るのはコミット済みの内容なので、作業ツリーからは読まない
 async function readDocs($: EngineInterface, root: string, head: string): Promise<Doc[]> {
   const list = await git($, ['ls-tree', '-r', '--name-only', head], root)
@@ -241,13 +346,13 @@ async function judge($: EngineInterface, model: string, docs: Doc[], diff: strin
 }
 
 // 判定できなかったとき、続けるかをユーザーに聞く。答えられない(-p 実行・閉じた)ときは中止
-async function confirmAfterFailure($: EngineInterface, reason: string): Promise<boolean> {
+async function confirmAfterFailure($: EngineInterface, action: Action, reason: string): Promise<boolean> {
   try {
     const answer = await $.ui.ask(
-      `docs-sync: 実装とドキュメントの差異を確認できませんでした(${reason})。このまま PR を作成しますか?`,
-      { header: 'docs-sync', options: [ASK_CONTINUE, ASK_CANCEL] },
+      `docs-sync: 実装とドキュメントの差異を確認できませんでした(${reason})。${action.ask}`,
+      { header: 'docs-sync', options: [action.proceed, ASK_CANCEL] },
     )
-    return answer === ASK_CONTINUE
+    return answer === action.proceed
   } catch {
     return false
   }
@@ -260,11 +365,39 @@ export function parsePrCreate(command: string): PrCreate | undefined {
 
 // 区切りを順にたどって gh pr create を探す。cds はそこまでに実行される cd
 function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undefined {
+  return findCommand(segments, outerCds, (words, cds) => {
+    if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'create') return undefined
+    const args = parseCreateArgs(words.slice(3))
+    if (args.help) return null
+    return { cds, base: args.base, head: args.head }
+  })
+}
+
+// コマンドが git push を実行するなら、その内容を返す。ブランチの削除・dry run・タグだけの push などは対象外
+export function parsePush(command: string): Push | undefined {
+  return findCommand(splitCommand(command), [], (words, cds) => {
+    if (words[0] !== 'git') return undefined
+    // git の全体のオプション。-C は cd と同じく場所を変える
+    const here = [...cds]
+    let i = 1
+    while (i < words.length && words[i]!.startsWith('-')) {
+      if (words[i] === '-C') here.push(words[i + 1] ?? '')
+      i += words[i] === '-C' || words[i] === '-c' ? 2 : 1
+    }
+    if (words[i] !== 'push') return undefined
+    const refs = parsePushArgs(words.slice(i + 1))
+    return refs === undefined ? null : { cds: here, refs }
+  })
+}
+
+// 区切りを順にたどり、match が値を返した最初のコマンドを返す。match は、対象外なら undefined、
+// 見つけたが判定しないなら null を返す。cds はそこまでに実行される cd
+function findCommand<T>(segments: Segment[], outerCds: string[], match: (words: string[], cds: string[]) => T | null | undefined): T | undefined {
   const cds = [...outerCds]
   for (const segment of segments) {
     // コマンド置換は区切りより先に、サブシェルで実行される。外の cd は引き継ぐが、中の cd は外に漏れない
     for (const sub of segment.subs) {
-      const found = findPrCreate(sub, cds)
+      const found = findCommand(sub, cds, match)
       if (found !== undefined) return found
     }
     const words = stripPrefixes(segment.words)
@@ -272,12 +405,55 @@ function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undef
       if (words[1] !== '-') cds.push(words[1] ?? '')
       continue
     }
-    if (words[0] !== 'gh' || words[1] !== 'pr' || words[2] !== 'create') continue
-    const args = parseCreateArgs(words.slice(3))
-    if (args.help) return undefined
-    return { cds, base: args.base, head: args.head }
+    const found = match(words, [...cds])
+    if (found === null) return undefined
+    if (found !== undefined) return found
   }
   return undefined
+}
+
+// git push のうち、値を取るオプション(--opt=value の形でないとき、次の単語が値)
+const PUSH_VALUE_FLAGS = new Set(['--repo', '--push-option', '--receive-pack', '--exec'])
+// これがあれば判定しない。削除・dry run・ヘルプ・すべての ref の push
+const PUSH_SKIP_FLAGS = new Set(['--delete', '--dry-run', '--help', '--all', '--branches', '--mirror', '--prune'])
+
+// git push の引数から refspec を読む。判定しない push なら undefined
+function parsePushArgs(args: string[]): PushRef[] | undefined {
+  const positional: string[] = []
+  let tags = false
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i]!
+    if (a === '--') {
+      positional.push(...args.slice(i + 1))
+      break
+    }
+    if (a.startsWith('--')) {
+      const name = a.includes('=') ? a.slice(0, a.indexOf('=')) : a
+      if (PUSH_SKIP_FLAGS.has(name)) return undefined
+      if (name === '--tags') tags = true
+      if (PUSH_VALUE_FLAGS.has(name) && !a.includes('=')) i += 1
+    } else if (a.startsWith('-') && a.length > 1) {
+      // `-uf` のような短いオプションの連結。-d・-n・-h は判定しない、-o は値を取る
+      for (let k = 1; k < a.length; k++) {
+        const ch = a[k]!
+        if ('dnh'.includes(ch)) return undefined
+        if (ch === 'o') {
+          if (k === a.length - 1) i += 1
+          break
+        }
+      }
+    } else {
+      positional.push(a)
+    }
+  }
+  // 1 つ目は push 先のリモート、残りが refspec
+  const refs = positional.slice(1).map(spec => {
+    const colon = spec.indexOf(':')
+    return colon < 0 ? { src: spec } : { src: spec.slice(0, colon), dst: spec.slice(colon + 1) }
+  })
+  // refspec のない --tags は、タグだけを push する
+  if (refs.length === 0 && tags) return undefined
+  return refs
 }
 
 // 先頭の環境変数の指定(NAME=value)と、env・command・time などの前置きを飛ばす
@@ -569,10 +745,10 @@ function normalizePath(path: string): string {
   return path.trim().replace(/^\.\//, '')
 }
 
-export function driftDeny(findings: Finding[]): string {
+export function driftDeny(action: Action, findings: Finding[]): string {
   const lines = findings.map(f => `- ${f.doc}: ${f.issue}${f.fix ? ` (suggested fix: ${f.fix})` : ''}`)
   return [
-    'docs-sync: PR creation was blocked because the documentation does not match the implementation on this branch.',
+    `docs-sync: ${action.blocked} because the documentation does not match the implementation on this branch.`,
     '',
     'Findings:',
     ...lines,
@@ -581,21 +757,21 @@ export function driftDeny(findings: Finding[]): string {
     '1. Update the documentation to match the implementation.',
     '2. If the project treats its docs as the spec (e.g. CLAUDE.md says so) and the implementation deviates from that spec, do not edit either side yet: ask the user which one to change.',
     '3. If you think a finding is wrong, explain why to the user and ask how to proceed. Do not try to get around this check.',
-    '4. Commit the fixes, push them, and run gh pr create again. docs-sync checks the new commit.',
+    `4. ${action.retry} docs-sync checks the new commit.`,
   ].join('\n')
 }
 
-export function passNote(detail: string): string {
-  return `docs-sync: the documentation check ran before this gh pr create and let it through: ${detail}.`
+export function passNote(action: Action, detail: string): string {
+  return `docs-sync: the documentation check ran before this ${action.command} and let it through: ${detail}.`
 }
 
-export function failureNote(reason: string): string {
-  return `docs-sync: the documentation check could not run before this gh pr create (${reason}), and the user chose to create the PR anyway. The documentation was not verified against the implementation.`
+export function failureNote(action: Action, reason: string): string {
+  return `docs-sync: the documentation check could not run before this ${action.command} (${reason}), and the user chose to go ahead anyway. The documentation was not verified against the implementation.`
 }
 
-export function failureDeny(reason: string): string {
+export function failureDeny(action: Action, reason: string): string {
   return [
-    `docs-sync: PR creation was blocked because the documentation check could not run (${reason}).`,
+    `docs-sync: ${action.blocked} because the documentation check could not run (${reason}).`,
     'Tell the user what happened and ask how to proceed. Do not try to get around this check.',
   ].join('\n')
 }

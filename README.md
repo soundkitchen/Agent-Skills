@@ -14,7 +14,7 @@ Claude Code 用の自作 skill と mod の集まり。
 
 | mod | 概要 |
 |---|---|
-| [docs-sync](docs-sync/README.md) | PR を作る前に、実装とドキュメントの差異を確認する。Claude が `gh pr create` を実行する直前に割り込み、ずれがあれば止めて直させる |
+| [docs-sync](docs-sync/README.md) | PR に入る前に、実装とドキュメントの差異を確認する。Claude が `gh pr create` や、開いている PR があるブランチへの `git push` を実行する直前に割り込み、ずれがあれば止めて直させる |
 
 mod は、Claude Code の動きそのものに割り込む拡張(JavaScript / TypeScript で書く plugin)。skill と違って呼び出す必要はなく、インストールしておけばすべてのセッションで常に動く。
 
