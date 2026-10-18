@@ -29,7 +29,6 @@ Look at both the repository and this conversation. Do not change anything in thi
 - Unpushed commits (compare with the upstream; a branch with no upstream counts as unpushed)
 - `git fetch --prune`, then: merged local branches, and worktrees (`git worktree list`) whose branch is merged (see "Merged branches" below)
 - The current branch's PR and its state (`gh pr view`); other open PRs and Issues this session worked on
-- PR refs fetched for review (`git for-each-ref refs/pr/`; the you-are-a-reviewer skill fetches each reviewed PR into `refs/pr/<n>`), and the state of each PR (`gh pr view <n> --json state`, in the repository that `gh` resolves)
 
 **Merged branches**: a branch counts as merged only if its PR was merged (`gh pr list --state merged --head <branch>`), or its upstream is gone after `git fetch --prune`. Do not use `git branch --merged` alone: a branch just created from the default branch, with no commits yet, also appears there, and it may be another session's work that has just started. A branch that points at the same commit as the default branch (`origin/<default>`) and has no merged PR is not merged; report it instead.
 
@@ -39,7 +38,7 @@ Look at both the repository and this conversation. Do not change anything in thi
 - Docs that no longer match what was implemented or decided in this session (README, `docs/`, CLAUDE.md, TODO.md, etc.). Compare the changes of this session (the branch's diff and uncommitted changes) against them
 - What remains of the work: unfinished tasks, follow-ups the user postponed (e.g. "別 Issue にしよう", "あとで"), bugs found but not fixed, open questions, and decisions or findings that exist only in this conversation
 
-Only consider things this session created or worked on, plus merged branches and worktrees, and the PR refs of merged or closed PRs. Do not touch processes, files, or branches the user created or that belong to other sessions; if something looks abandoned but you are not sure, report it instead.
+Only consider things this session created or worked on, plus merged branches and worktrees. Do not touch processes, files, or branches the user created or that belong to other sessions; if something looks abandoned but you are not sure, report it instead.
 
 ## 2. Clean up the mechanical ones (no confirmation)
 
@@ -49,7 +48,6 @@ Do these without asking, unless the user's notes say otherwise, in this order:
 2. If the current branch is merged, the working tree is clean, and you are in the main worktree, switch to the default branch and update it (`git pull --ff-only`). Doing this first lets the branch deletions below succeed with `-d`
 3. Remove worktrees whose branch is merged and that have no uncommitted changes (`git worktree remove`, never `--force`). Never remove the main worktree or the worktree this session is working in (`git worktree remove` succeeds even when run from inside the worktree it removes); report those instead
 4. Delete merged local branches (`git branch -d`, never `-D`). Never delete the current branch, the default branch, a branch still checked out in a worktree, or remote branches
-5. Delete the PR refs whose PR is merged or closed (`git update-ref -d refs/pr/<n>`). Keep the ones whose PR is open (a reviewer session may still be using them) or whose state could not be checked. If a closed PR is reopened and reviewed again, the reviewer fetches it again
 
 If any of these fails or looks unsafe (e.g. unmerged commits, uncommitted changes), stop that item and report it instead.
 
