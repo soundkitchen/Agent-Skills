@@ -61,6 +61,6 @@ claude -n skill-reviewer
 
 ## 注意
 
-- `refs/pr/<番号>` が消えるのは、マージの通知を受けたときだけ。GitHub の画面や別のセッションでマージした PR、マージせずに閉じた PR の ref は、レビュアーの clone に残る。残っても実害はほとんどない(普段の `git log` や `git branch` には出ない)が、まとめて消すなら、レビュー中でないときに `git for-each-ref --format='%(refname)' refs/pr/ | xargs -n 1 git update-ref -d` を実行する
+- `refs/pr/<番号>` が消えるのは、マージの通知を受けたときだけ。GitHub の画面や別のセッションでマージした PR、マージせずに閉じた PR の ref は、レビュアーの clone に残る。残っても実害はほとんどない(普段の `git log` や `git branch` には出ない)が、まとめて消すなら、レビュー中でないときに `git for-each-ref --format='%(refname)' refs/pr/ | grep -E '^refs/pr/[0-9]+$' | xargs -n 1 git update-ref -d` を実行する(名前が番号の ref だけを消す)。`+refs/pull/*/head:refs/pr/*` のように `refs/pr/` へ書き込む fetch の設定があるリポジトリでは、その ref も消えるので使わない
 - 依頼元とレビュアーのセッションで権限モードが違うと、依頼メッセージがユーザーの承認待ちで止まることがある
 - skill を更新しても、すでに起動しているレビュアーは古い内容のまま動き続ける。反映するには、そのセッションで `/you-are-a-reviewer` を呼び出し直すか、セッションを起動し直す。起動し直したレビュアーは前回までのレビューの記録を持たないが、依頼元が前回の指摘と前回レビューしたコミットを添えれば、再レビューとして扱う
