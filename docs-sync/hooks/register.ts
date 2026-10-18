@@ -17,7 +17,8 @@ type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: F
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
 // mover は、同じコマンドの中で先に実行される、読むだけでない git コマンド(`git commit` など)
-export type PrCreate = { cds: string[]; base?: string; head?: string; mover?: string }
+// repo は -R / --repo の指定(PR を出す先のリポジトリ)
+export type PrCreate = { cds: string[]; base?: string; head?: string; repo?: string; mover?: string }
 // コマンドから読み取った git push の内容。remote は push 先の指定(省略時は git の既定)、refs が空なら今のブランチを push する
 export type Push = { cds: string[]; remote?: string; refs: PushRef[]; mover?: string }
 // push する refspec。src は push するコミット、dst は push 先のブランチ(省略時は src と同じ)
@@ -86,8 +87,15 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
   const root = await resolveRoot($, pr.cds)
   const head = await resolveHead($, root, pr.head)
   if (head === undefined) throw new CheckFailed(`could not resolve the head ${pr.head ?? 'HEAD'}`)
-  const base = await resolveBase($, root, pr.base)
-  if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base ?? ''}`.trim())
+  // PR を出す先のリポジトリ(fork の構成なら元のリポジトリ)と、その既定のブランチ。
+  // remote が 1 つで -R もなければ、その remote を使うしかないので gh には問い合わせない
+  const remotes = await remoteRepos($, root)
+  const only = pr.repo === undefined && remotes.names.length === 1 ? remotes.names[0] : undefined
+  const target = only === undefined ? await ghRepo($, root, pr.repo) : undefined
+  const remote = only ?? remoteFor(remotes.repos, target?.repo)
+  const branch = pr.base ?? target?.defaultBranch
+  const base = await resolveBase($, root, remote, branch)
+  if (base === undefined) throw new CheckFailed(baseFailure(remote, branch))
   return check($, root, base, head, signal)
 }
 
@@ -95,10 +103,10 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
 // 判定するものがなければ undefined。最初のずれ(または分けて実行させるもの)で止める
 async function checkPushes($: EngineInterface, pushes: Push[], signal: AbortSignal): Promise<Verdict | undefined> {
   // 開いている PR の一覧は、リポジトリごとに 1 回だけ問い合わせる
-  const prsByRoot = new Map<string, OpenPr[] | undefined>()
+  const cache: PushCache = { prs: new Map(), remotes: new Map() }
   const details: string[] = []
   for (const push of pushes) {
-    const v = await checkPush($, push, prsByRoot, signal)
+    const v = await checkPush($, push, cache, signal)
     if (v === undefined) continue
     if (v.status !== 'ok') return v
     details.push(v.detail)
@@ -108,7 +116,10 @@ async function checkPushes($: EngineInterface, pushes: Push[], signal: AbortSign
 
 // push 1 つ分。push 先のブランチに開いている PR があれば、push するコミットで PR の内容を判定する。
 // 判定するものがなければ undefined。refspec が複数あれば順に判定し、最初のずれで止める
-async function checkPush($: EngineInterface, push: Push, prsByRoot: Map<string, OpenPr[] | undefined>, signal: AbortSignal): Promise<Verdict | undefined> {
+// コマンドの中の push で使い回す、リポジトリ(root)ごとの開いている PR の一覧と、remote からリポジトリへの対応
+type PushCache = { prs: Map<string, OpenPr[] | undefined>; remotes: Map<string, Remotes> }
+
+async function checkPush($: EngineInterface, push: Push, cache: PushCache, signal: AbortSignal): Promise<Verdict | undefined> {
   // push 先が今のブランチや設定で決まる push の前に mover があると、mover がブランチや設定を変えうるので、
   // 実行前の今の状態からは push 先(と開いている PR があるか)がわからない。PR の有無に関係なく分けて実行させる
   if (push.mover !== undefined && dependsOnCurrentState(push)) return { status: 'split', mover: push.mover }
@@ -125,8 +136,8 @@ async function checkPush($: EngineInterface, push: Push, prsByRoot: Map<string, 
   const refs = await pushRefs($, root, push.refs, remote.name, current)
   if (refs.length === 0) return undefined
   // 開いている PR を、push 先のリポジトリとブランチで突き合わせる
-  if (!prsByRoot.has(root)) prsByRoot.set(root, await openPrs($, root))
-  const prs = prsByRoot.get(root)
+  if (!cache.prs.has(root)) cache.prs.set(root, await openPrs($, root))
+  const prs = cache.prs.get(root)
   if (prs === undefined) return undefined
 
   const targets = refs.flatMap(ref => prs.filter(p => p.repo === remote.repo && p.head === ref.dst).map(pr => ({ ref, pr })))
@@ -137,8 +148,10 @@ async function checkPush($: EngineInterface, push: Push, prsByRoot: Map<string, 
   for (const { ref, pr } of targets) {
     const head = await firstCommit($, root, [ref.src])
     if (head === undefined) throw new CheckFailed(`could not resolve the commit to push (${ref.src})`)
-    const base = await resolveBase($, root, pr.base)
-    if (base === undefined) throw new CheckFailed(`could not resolve the base branch ${pr.base} of PR #${pr.number}`)
+    if (!cache.remotes.has(root)) cache.remotes.set(root, await remoteRepos($, root))
+    const baseRemote = remoteFor(cache.remotes.get(root)!.repos, pr.baseRepo)
+    const base = await resolveBase($, root, baseRemote, pr.base)
+    if (base === undefined) throw new CheckFailed(`${baseFailure(baseRemote, pr.base)} for PR #${pr.number}`)
     const v = await check($, root, base, head, signal)
     if (v.status !== 'ok') return v
     details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
@@ -250,18 +263,74 @@ async function resolveHead($: EngineInterface, root: string, flag: string | unde
   return firstCommit($, root, [`origin/${branch}`, branch])
 }
 
-// --base の指定があれば origin/<base> を優先し、なければ origin の既定ブランチを使う
-async function resolveBase($: EngineInterface, root: string, flag: string | undefined): Promise<string | undefined> {
-  const candidates = flag !== undefined ? [`origin/${flag}`, flag] : []
-  if (flag === undefined) {
-    const remoteHead = await git($, ['symbolic-ref', '--short', 'refs/remotes/origin/HEAD'], root)
-    if (remoteHead !== undefined) candidates.push(remoteHead)
-    candidates.push('origin/main', 'main')
+// base のブランチの指定があれば <remote>/<base>、origin/<base>、ローカルの <base> の順に試し、
+// なければ remote(と origin)の既定ブランチを使う。remote は、PR の base があるリポジトリを指すもの
+// (fork の構成なら upstream など)。<remote>/<base> をまだ fetch していなければ、origin のものに戻る
+async function resolveBase($: EngineInterface, root: string, remote: string, branch: string | undefined): Promise<string | undefined> {
+  const remotes = remote === 'origin' ? ['origin'] : [remote, 'origin']
+  const candidates = branch !== undefined ? [...remotes.map(r => `${r}/${branch}`), branch] : []
+  if (branch === undefined) {
+    // remote ごとに、既定ブランチ(<remote>/HEAD が指すもの)、<remote>/main の順に試す
+    for (const r of remotes) {
+      const remoteHead = await git($, ['symbolic-ref', '--short', `refs/remotes/${r}/HEAD`], root)
+      if (remoteHead !== undefined) candidates.push(remoteHead)
+      candidates.push(`${r}/main`)
+    }
+    candidates.push('main')
   }
   for (const ref of candidates) {
     if ((await git($, ['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], root)) !== undefined) return ref
   }
   return undefined
+}
+
+// base を解決できなかったときの理由。何を fetch すればよいかがわかるように、remote とブランチを含める
+function baseFailure(remote: string, branch: string | undefined): string {
+  return branch !== undefined
+    ? `could not resolve the base branch ${branch} (tried ${remote}/${branch}${remote === 'origin' ? '' : `, origin/${branch}`} and ${branch})`
+    : `could not resolve the default branch of ${remote} (tried ${remote}/HEAD, ${remote}/main${remote === 'origin' ? '' : ', origin/HEAD, origin/main'} and main)`
+}
+
+// names はすべての remote の名前、repos は remote の名前からそれが指すリポジトリ(owner/name、小文字)への対応
+// (URL からリポジトリを読み取れた remote だけ)
+type Remotes = { names: string[]; repos: Map<string, string> }
+
+// git remote -v の fetch の行から、remote の一覧を作る。partial clone の remote は行末に [blob:none] などが付く
+async function remoteRepos($: EngineInterface, root: string): Promise<Remotes> {
+  const names: string[] = []
+  const repos = new Map<string, string>()
+  for (const line of ((await git($, ['remote', '-v'], root)) ?? '').split('\n')) {
+    const m = /^(\S+)\s+(\S+)\s+\(fetch\)(?:\s.*)?$/.exec(line)
+    if (m === null) continue
+    names.push(m[1]!)
+    const repo = repoOf(m[2]!)
+    if (repo !== undefined) repos.set(m[1]!, repo)
+  }
+  return { names, repos }
+}
+
+// リポジトリ(owner/name)を指す remote。origin が指していれば origin、なければほかの remote から探す。
+// 見つからない、またはリポジトリがわからなければ origin
+function remoteFor(remotes: Map<string, string>, repo: string | undefined): string {
+  if (repo === undefined || remotes.get('origin') === repo) return 'origin'
+  for (const [name, r] of remotes) if (r === repo) return name
+  return 'origin'
+}
+
+// gh が PR を出す先とするリポジトリ(owner/name、小文字)と、その既定のブランチ。-R の指定があればそのリポジトリ。
+// gh で確かめられなければ undefined
+async function ghRepo($: EngineInterface, root: string, flag: string | undefined): Promise<{ repo: string; defaultBranch?: string } | undefined> {
+  try {
+    const argv = ['gh', 'repo', 'view', ...(flag !== undefined ? [flag] : []), '--json', 'nameWithOwner,defaultBranchRef']
+    const r = await $.process.run(argv, { cwd: root, timeoutMs: GH_TIMEOUT_MS })
+    if (r.exitCode !== 0) return undefined
+    const v = parseJson(r.stdout) as { nameWithOwner?: unknown; defaultBranchRef?: { name?: unknown } } | undefined
+    if (typeof v?.nameWithOwner !== 'string') return undefined
+    const name = v.defaultBranchRef?.name
+    return typeof name === 'string' && name !== '' ? { repo: v.nameWithOwner.toLowerCase(), defaultBranch: name } : { repo: v.nameWithOwner.toLowerCase() }
+  } catch {
+    return undefined
+  }
 }
 
 // 候補のうち最初に解決できた ref のコミット
@@ -322,14 +391,15 @@ async function pushRefs($: EngineInterface, root: string, refs: PushRef[], remot
   return out
 }
 
-type OpenPr = { number: number; base: string; head: string; repo: string }
+// repo は head のブランチがあるリポジトリ、baseRepo は PR を出した先のリポジトリ(どちらも owner/name、小文字)
+type OpenPr = { number: number; base: string; head: string; repo: string; baseRepo?: string }
 const GH_TIMEOUT_MS = 15_000
 
-// 開いている PR の一覧。repo は head のブランチがあるリポジトリ(owner/name、小文字)。gh で確かめられなければ undefined
+// 開いている PR の一覧。gh で確かめられなければ undefined
 async function openPrs($: EngineInterface, root: string): Promise<OpenPr[] | undefined> {
   try {
     const r = await $.process.run(
-      ['gh', 'pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,baseRefName,headRefName,headRepository,headRepositoryOwner'],
+      ['gh', 'pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,url,baseRefName,headRefName,headRepository,headRepositoryOwner'],
       { cwd: root, timeoutMs: GH_TIMEOUT_MS },
     )
     if (r.exitCode !== 0 || r.isStdoutTruncated) return undefined
@@ -340,7 +410,10 @@ async function openPrs($: EngineInterface, root: string): Promise<OpenPr[] | und
       const name = p?.headRepository?.name
       if (typeof p?.number !== 'number' || typeof p.baseRefName !== 'string' || typeof p.headRefName !== 'string') return []
       if (typeof owner !== 'string' || typeof name !== 'string') return []
-      return [{ number: p.number, base: p.baseRefName, head: p.headRefName, repo: `${owner}/${name}`.toLowerCase() }]
+      // PR の URL(https://<host>/<owner>/<name>/pull/<number>)から、PR を出した先のリポジトリを読む
+      const base = typeof p.url === 'string' ? /^https?:\/\/[^/]+\/([^/]+)\/([^/]+)\/pull\/\d+/.exec(p.url) : null
+      const pr: OpenPr = { number: p.number, base: p.baseRefName, head: p.headRefName, repo: `${owner}/${name}`.toLowerCase() }
+      return [base === null ? pr : { ...pr, baseRepo: `${base[1]}/${base[2]}`.toLowerCase() }]
     })
   } catch {
     return undefined
@@ -446,6 +519,7 @@ function findPrCreate(segments: Segment[], outerCds: string[]): PrCreate | undef
     const args = parseCreateArgs(words.slice(3))
     if (args.help) return undefined
     const pr: PrCreate = { cds, base: args.base, head: args.head }
+    if (args.repo !== undefined) pr.repo = args.repo
     return mover === undefined ? pr : { ...pr, mover }
   })[0]
 }
@@ -629,8 +703,8 @@ const VALUE_FLAGS: Record<string, string> = {
 }
 const LONG_VALUE_FLAGS = new Set([...Object.values(VALUE_FLAGS), 'recover'])
 
-// gh pr create の引数から --base / --head / --help を読む。ほかのフラグの値(--title "-Hotfix" など)は読み飛ばす
-function parseCreateArgs(args: string[]): { base?: string; head?: string; help: boolean } {
+// gh pr create の引数から --base / --head / --repo / --help を読む。ほかのフラグの値(--title "-Hotfix" など)は読み飛ばす
+function parseCreateArgs(args: string[]): { base?: string; head?: string; repo?: string; help: boolean } {
   const values: Record<string, string> = {}
   let help = false
   for (let i = 0; i < args.length; i++) {
@@ -658,7 +732,7 @@ function parseCreateArgs(args: string[]): { base?: string; head?: string; help: 
       }
     }
   }
-  return { base: values['base'], head: values['head'], help }
+  return { base: values['base'], head: values['head'], repo: values['repo'], help }
 }
 
 type Heredoc = { delim: string; strip: boolean }
