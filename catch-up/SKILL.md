@@ -1,6 +1,6 @@
 ---
 name: catch-up
-description: Start a session (thread) by catching up - read where earlier sessions left off (handoffs in Issues, PR comments, docs, TODO) and the open Issues and PRs, summarize where things stand, and propose the next task. With an Issue or PR number (#N), grasp that Issue or PR and the code and docs it touches, propose a plan, and stop before implementing. The counterpart of wrap-up. Use when the user starts a thread and asks to get up to speed, e.g. "全体を把握して次のタスクを提案して", "前回どこまで進めた?", "現状を把握してください", "#12 対応を進めます。Issue 内容とプロジェクト全体を把握してください", "#22 を進めましょう", "まずは Issue 内容と影響範囲を把握してください". Not for work already in progress in this session.
+description: Start a session (thread) by catching up - read where earlier sessions left off (handoffs in Issues, PR comments, docs, TODO) and the open Issues and PRs, summarize where things stand, and propose the next task. With an Issue number (#N), grasp the Issue and the code and docs it touches, propose a plan, and stop before implementing. With a PR number, summarize where the PR stands and the next step. The counterpart of wrap-up. Use when the user starts a thread and asks to get up to speed, e.g. "全体を把握して次のタスクを提案して", "前回どこまで進めた?", "現状を把握してください", "#12 対応を進めます。Issue 内容とプロジェクト全体を把握してください", "#22 を進めましょう", "まずは Issue 内容と影響範囲を把握してください". Not for work already in progress in this session.
 argument-hint: "[#N] [notes, e.g. what to look at]"
 ---
 
