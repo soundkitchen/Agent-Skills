@@ -3,17 +3,27 @@ import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 // 判定の上限。モデルは作業中のセッションと同じものを使う
 const MAX_TOKENS = 4096
 const JUDGE_TIMEOUT_MS = 5 * 60 * 1000
-// 1 回の判定に渡すテキストの上限(文字数)。超えたら関係するドキュメントを先に選ばせる
+// 1 回の判定に渡すテキストの上限(文字数)。超えたら関係するドキュメントを先に選ばせ、差分を分けて判定する
 const PROMPT_BUDGET = 300_000
+// 差分を分けて判定するときの回数の上限。入りきらないファイルは、判定できなかったものとして扱う
+const MAX_PARTS = 5
 // 判定の対象にするドキュメント
 const DOC_FILE = /\.mdx?$/
+// 差分を分けるときに判定から外すファイル。lock ファイル・minify されたもの・source map は、ドキュメントとのずれに関係しない
+// (バイナリと、.gitattributes で linguist-generated・linguist-vendored のものも外す)
+const SKIP_FILE =
+  /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|deno\.lock|Cargo\.lock|Gemfile\.lock|poetry\.lock|Pipfile\.lock|uv\.lock|composer\.lock|go\.sum|flake\.lock|Podfile\.lock|Package\.resolved|packages\.lock\.json|mix\.lock|pubspec\.lock)$|\.min\.(js|css)$|\.map$/
 
 const ASK_CANCEL = '中止する'
 
 type Finding = { doc: string; issue: string; fix: string }
 // ok の detail は、通した理由を Claude に伝える文
+// drift の unchecked は、差分を分けて判定したときに判定できなかったファイル
 // split は、同じコマンドの中の mover のために判定できないので、分けて実行させる
-type Verdict = { status: 'ok'; detail: string } | { status: 'drift'; findings: Finding[] } | { status: 'split'; mover: string }
+type Verdict =
+  | { status: 'ok'; detail: string }
+  | { status: 'drift'; findings: Finding[]; unchecked: string[] }
+  | { status: 'split'; mover: string }
 type Doc = { path: string; text: string }
 // コマンドから読み取った PR 作成の内容
 // mover は、同じコマンドの中で先に実行される、読むだけでない git コマンド(`git commit` など)
@@ -41,8 +51,28 @@ const PUSH: Action = {
   proceed: 'このまま push する',
 }
 
-// 判定できなかったことを表す。ユーザーに続けるか聞く
-class CheckFailed extends Error {}
+// 止めたときに Claude へ示す、次に取れる手段
+type Hint = (action: Action) => string
+const RETRY: Hint = a => `Run ${a.command} again. The failure may be temporary.`
+const SPLIT_PR: Hint = () => 'Split the branch into smaller pull requests, so that each diff is small enough to check.'
+const DISABLE: Hint = () => 'To turn docs-sync off for a while, the user can run claude plugin disable docs-sync@skills-dir (and enable it again afterwards).'
+const BY_HAND: Hint = a =>
+  `If the user wants to go ahead without the check, they can run ${a.command} themselves in their own terminal. docs-sync only checks the commands that Claude runs.`
+const fetchBase = (remote: string): Hint => () => `Fetch the base branch (git fetch ${remote}) and run again.`
+
+// 判定できなかったことを表す。ユーザーに続けるか聞く。
+// hints は止めたときに示す手段、files は判定できなかったファイル、
+// skip はユーザーが続けることを選んだときに記録する先(もう一度実行しても判定できない、差分が大きすぎるときだけ)
+class CheckFailed extends Error {
+  hints: Hint[]
+  files: string[]
+  skip?: { key: string; head: string }
+  constructor(message: string, hints: Hint[] = [], files: string[] = []) {
+    super(message)
+    this.hints = hints
+    this.files = files
+  }
+}
 
 export const register: Register = on => {
   on('tool.call', { tool: 'Bash' }, async ($, e, next) => {
@@ -57,18 +87,27 @@ export const register: Register = on => {
       verdict = pr !== undefined ? await checkPrCreate($, pr, next.signal) : await checkPushes($, pushes, next.signal)
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
-      if (!(await confirmAfterFailure($, action, reason))) return { deny: failureDeny(action, reason) }
-      return withNote(await next(e), failureNote(action, reason))
+      const failed = err instanceof CheckFailed ? err : new CheckFailed(reason)
+      if (!(await confirmAfterFailure($, action, failed))) return { deny: failureDeny(action, reason, failed.hints) }
+      const r = await next(e)
+      // 差分が大きすぎて判定しきれなかったコミットで続けることを選び、コマンドが実行されたら、
+      // 同じ base ではもう判定しない(記録できなくても続ける)
+      if (failed.skip !== undefined && r.deny === undefined) {
+        try {
+          await $.store.set(failed.skip.key, failed.skip.head)
+        } catch {}
+      }
+      return withNote(r, failureNote(action, reason))
     }
 
     // 開いている PR がないブランチへの push は、判定しない(PR を作るときに判定する)
     if (verdict === undefined) return next(e)
     if (verdict.status === 'ok') return withNote(await next(e), passNote(action, verdict.detail))
     if (verdict.status === 'split') return { deny: splitDeny(action, verdict.mover) }
-    return { deny: driftDeny(action, verdict.findings) }
+    return { deny: driftDeny(action, verdict.findings, verdict.unchecked) }
   }).catch(async ($, e, next) => {
     // hook 自体が落ちたときは通さない側に倒す
-    return { deny: failureDeny(actionOf(e.command), `the docs-sync hook failed (${next.error.kind})`) }
+    return { deny: failureDeny(actionOf(e.command), `the docs-sync hook failed (${next.error.kind})`, [RETRY]) }
   })
 }
 
@@ -95,7 +134,7 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
   const remote = only ?? remoteFor(remotes.repos, target?.repo)
   const branch = pr.base ?? target?.defaultBranch
   const base = await resolveBase($, root, remote, branch)
-  if (base === undefined) throw new CheckFailed(baseFailure(remote, branch))
+  if (base === undefined) throw new CheckFailed(baseFailure(remote, branch), [fetchBase(remote)])
   return check($, root, base, head, signal)
 }
 
@@ -151,7 +190,7 @@ async function checkPush($: EngineInterface, push: Push, cache: PushCache, signa
     if (!cache.remotes.has(root)) cache.remotes.set(root, await remoteRepos($, root))
     const baseRemote = remoteFor(cache.remotes.get(root)!.repos, pr.baseRepo)
     const base = await resolveBase($, root, baseRemote, pr.base)
-    if (base === undefined) throw new CheckFailed(`${baseFailure(baseRemote, pr.base)} for PR #${pr.number}`)
+    if (base === undefined) throw new CheckFailed(`${baseFailure(baseRemote, pr.base)} for PR #${pr.number}`, [fetchBase(baseRemote)])
     const v = await check($, root, base, head, signal)
     if (v.status !== 'ok') return v
     details.push(`for PR #${pr.number} (${ref.dst}), ${v.detail}`)
@@ -175,34 +214,253 @@ async function resolveRoot($: EngineInterface, cds: string[]): Promise<string> {
 
 // base...head の差分とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる
 async function check($: EngineInterface, root: string, base: string, head: string, signal: AbortSignal): Promise<Verdict> {
-  // 同じ base で最後に通ったコミットと同じなら判定し直さない
+  // 同じ base で最後に通ったコミット、または判定しきれずに続けることが選ばれたコミットと同じなら判定し直さない
   const cacheKey = `pass:${root}:${base}`
+  const skipKey = `skip:${root}:${base}`
   const short = head.slice(0, 7)
   if ((await $.store.get(cacheKey)) === head) {
     return { status: 'ok', detail: `commit ${short} already passed the check against ${base}, so it was not checked again` }
   }
+  if ((await $.store.get(skipKey)) === head) {
+    return { status: 'ok', detail: `the user already chose to go ahead without a full check for commit ${short} against ${base}, so it was not checked again` }
+  }
 
-  const diff = await git($, ['diff', '--no-color', `${base}...${head}`], root)
-  if (diff === undefined) throw new CheckFailed(`git diff ${base}...${head} failed`)
-  if (diff.trim() === '') return { status: 'ok', detail: `there is no diff between ${base} and ${short}, so there was nothing to check` }
-  if (diff.length > PROMPT_BUDGET) throw new CheckFailed('the diff is too large to check')
+  const v = await compare($, root, base, head, { key: skipKey, head }, signal)
+  if (v.status === 'ok' && v.checked) {
+    // 記録できなくても判定結果は変えない(次回また判定するだけ)
+    try {
+      await $.store.set(cacheKey, head)
+    } catch {}
+  }
+  return v.status === 'ok' ? { status: 'ok', detail: v.detail } : v
+}
+
+// 判定する差分のかたまり。files は含まれるファイル
+type Piece = { files: string[]; diff: string }
+type Compared = { status: 'ok'; detail: string; checked: boolean } | Extract<Verdict, { status: 'drift' }>
+
+// check の本体。checked は、モデルで判定してずれがなかったか(差分やドキュメントがなくて通したときは false)。
+// skip は、差分が大きすぎて判定しきれなかったときに、ユーザーが続けることを選んだら記録する先
+async function compare($: EngineInterface, root: string, base: string, head: string, skip: { key: string; head: string }, signal: AbortSignal): Promise<Compared> {
+  const range = `${base}...${head}`
+  const short = head.slice(0, 7)
+  // 差分全体が 4 MiB を超えて切れたときも、ファイルごとに取り直して分けて判定する
+  const whole = await gitOut($, ['diff', '--no-color', range], root)
+  if (whole === undefined) throw new CheckFailed(`git diff ${range} failed`, [RETRY])
+  if (whole !== TRUNCATED && whole.trim() === '') {
+    return { status: 'ok', detail: `there is no diff between ${base} and ${short}, so there was nothing to check`, checked: false }
+  }
 
   const docs = await readDocs($, root, head)
-  if (docs.length === 0) return { status: 'ok', detail: `the repository has no Markdown documents at ${short}, so there was nothing to check` }
+  if (docs.length === 0) {
+    return { status: 'ok', detail: `the repository has no Markdown documents at ${short}, so there was nothing to check`, checked: false }
+  }
 
   // 実装を読む判定なので、作業中のセッションと同じモデルで見る
   const model = await $.session.model()
-  const changed = (await git($, ['diff', '--name-only', `${base}...${head}`], root)) ?? ''
-  const selected = await selectDocs($, model, docs, diff, changed, signal)
-  const findings = await judge($, model, selected, diff, signal)
-  if (findings.length > 0) return { status: 'drift', findings }
+  // 差分全体とドキュメントが予算に入るか、差分全体が予算の半分までなら、1 回で判定する(入らないドキュメントは選ばせる)
+  if (whole !== TRUNCATED && (whole.length + sizeOf(docs) <= PROMPT_BUDGET || whole.length <= PROMPT_BUDGET / 2)) {
+    const changed = (await git($, ['diff', '--name-only', range], root)) ?? ''
+    const selected = await selectDocs($, model, docs, PROMPT_BUDGET - whole.length, changed, signal)
+    const findings = await judge($, model, selected, whole, signal)
+    if (findings.length > 0) return { status: 'drift', findings, unchecked: [] }
+    const checked = `checked the diff ${base}...${short} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
+    return { status: 'ok', detail: checked, checked: true }
+  }
 
-  // 記録できなくても判定結果は変えない(次回また判定するだけ)
+  // 入らなければ、ドキュメントに関係しないファイルを外し、ファイルごとの差分を詰めて分ける
+  const files = await fileDiffs($, root, range, head, whole)
+  if (files.pieces.length === 0 && files.huge.length === 0 && files.unreadable.length === 0) {
+    return { status: 'ok', detail: `the diff ${base}...${short} only changes files that do not affect the documentation (such as lock files, generated files and binaries), so there was nothing to check`, checked: false }
+  }
+  // 各回に変更されたファイルの一覧も渡すので、その分を除いた残りを、ドキュメントと差分で分ける。
+  // ドキュメントには、差分が入りきらないときでも半分までを使う
+  const changed = changedList(files.paths, files.skipped)
+  const avail = PROMPT_BUDGET - changed.length
+  const total = files.pieces.reduce((n, p) => n + p.diff.length, 0)
+  const selected = files.pieces.length > 0 ? await selectDocs($, model, docs, avail - Math.min(total, avail / 2), changed, signal) : []
+  const budget = avail - sizeOf(selected)
+  // 1 つで 1 回分に入らないファイルは判定できない
+  const tooLarge = [...files.huge, ...files.pieces.filter(p => p.diff.length > budget).flatMap(p => p.files)]
+  const parts = packPieces(files.pieces.filter(p => p.diff.length <= budget), budget)
+  const judged = parts.slice(0, MAX_PARTS)
+  const unchecked = [...tooLarge, ...files.unreadable, ...parts.slice(MAX_PARTS).flatMap(p => p.files)]
+
+  // ずれが見つかっても、残りの部分も最後まで判定して、まとめて伝える
+  const findings: Finding[] = []
+  const failures: string[] = []
   try {
-    await $.store.set(cacheKey, head)
+    for (const [i, part] of judged.entries()) {
+      if (judged.length > 1) showStatus($, `docs-sync: 差分を分けて確認しています(${i + 1}/${judged.length})`)
+      // 1 回で済むなら、分けていることは伝えない(ほかのファイルについての指摘を控えさせないため)
+      const context = judged.length > 1 ? { index: i + 1, count: judged.length, changed } : undefined
+      try {
+        findings.push(...(await judge($, model, selected, part.diff, signal, context)))
+      } catch (err) {
+        if (!(err instanceof CheckFailed)) throw err
+        failures.push(err.message)
+        unchecked.push(...part.files)
+      }
+    }
+  } finally {
+    if (judged.length > 1) showStatus($, undefined)
+  }
+
+  if (findings.length > 0) return { status: 'drift', findings, unchecked }
+  if (unchecked.length > 0) {
+    const why = [
+      ...(tooLarge.length > 0 ? [`${tooLarge.length} too large to check on their own`] : []),
+      ...(files.unreadable.length > 0 ? [`git diff failed for ${files.unreadable.length}`] : []),
+      ...(parts.length > MAX_PARTS ? [`the diff needed ${parts.length} parts and only ${MAX_PARTS} are checked`] : []),
+      ...failures.map(f => `a part failed: ${f}`),
+    ].join('; ')
+    const rest = failures.length < judged.length ? ', and the rest has no mismatch' : ''
+    // 一時的な失敗があれば、もう一度実行すれば判定できるかもしれないので、続けることを選んでも記録しない
+    const transient = files.unreadable.length > 0 || failures.length > 0
+    const err = new CheckFailed(
+      `the diff is too large to check in full: ${unchecked.length} changed files could not be checked (${why})${rest}`,
+      transient ? [RETRY, SPLIT_PR, DISABLE] : [SPLIT_PR, DISABLE],
+      unchecked,
+    )
+    if (!transient) err.skip = skip
+    throw err
+  }
+
+  const how = judged.length > 1 ? ` in ${judged.length} parts` : ''
+  const left = files.skipped.size > 0 ? ` (leaving out ${files.skipped.size} files that do not affect the documentation, such as lock files)` : ''
+  const checked = `checked the diff ${base}...${short}${how}${left} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
+  return { status: 'ok', detail: checked, checked: true }
+}
+
+function sizeOf(docs: Doc[]): number {
+  return docs.reduce((n, d) => n + d.text.length, 0)
+}
+
+// 進み具合をプロンプトの下に出す(undefined で消す)。出せなくても判定は続ける
+function showStatus($: EngineInterface, text: string | undefined): void {
+  try {
+    $.ui.status(text)
   } catch {}
-  const checked = `checked the diff ${base}...${short} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
-  return { status: 'ok', detail: checked }
+}
+
+// 変更されたファイル 1 つ。binary は、numstat で行数が出ない(バイナリの)もの
+type FileEntry = { path: string; binary: boolean }
+
+// 差分をファイルごとに分ける。差分全体を取れていれば、ファイルの境目で分ける(numstat は差分全体と同じ順・同じ rename の扱いで並ぶ)。
+// 切れていた、または numstat と数が合わないときは、rename を削除と追加として扱い、ファイルごとに取り直す。
+// paths は変更されたすべてのファイル、skipped はドキュメントに関係しないので外したもの、
+// huge は 1 つで 4 MiB を超えたもの、unreadable は差分を取れなかったもの
+async function fileDiffs(
+  $: EngineInterface,
+  root: string,
+  range: string,
+  head: string,
+  whole: string | typeof TRUNCATED,
+): Promise<{ paths: string[]; pieces: Piece[]; skipped: Set<string>; huge: string[]; unreadable: string[] }> {
+  let entries: FileEntry[] | undefined
+  let sections: string[] = []
+  if (whole !== TRUNCATED) {
+    entries = await numstat($, root, [range])
+    sections = splitSections(whole)
+    if (sections.length !== entries.length) entries = undefined
+  }
+  const byFile = entries === undefined
+  entries ??= await numstat($, root, ['--no-renames', range])
+
+  const generated = await generatedFiles($, root, head, entries.map(e => e.path))
+  const pieces: Piece[] = []
+  const skipped = new Set<string>()
+  const huge: string[] = []
+  const unreadable: string[] = []
+  for (const [i, { path, binary }] of entries.entries()) {
+    if (binary || SKIP_FILE.test(path) || generated.has(path)) {
+      skipped.add(path)
+      continue
+    }
+    const diff = byFile ? await gitOut($, ['diff', '--no-color', '--no-renames', range, '--', `:(literal)${path}`], root) : sections[i]!
+    if (diff === undefined) unreadable.push(path)
+    else if (diff === TRUNCATED) huge.push(path)
+    else if (diff.trim() !== '') pieces.push({ files: [path], diff })
+  }
+  return { paths: entries.map(e => e.path), pieces, skipped, huge, unreadable }
+}
+
+// git diff --numstat -z の結果。rename・copy は、パスが空で、続く 2 つが元と先のパスになるので、先のパスを使う
+async function numstat($: EngineInterface, root: string, args: string[]): Promise<FileEntry[]> {
+  const out = await git($, ['diff', '--numstat', '-z', ...args], root)
+  if (out === undefined) throw new CheckFailed(`git diff --numstat ${args.join(' ')} failed`, [RETRY])
+  const tokens = out.split('\0')
+  const entries: FileEntry[] = []
+  for (let i = 0; i < tokens.length; i++) {
+    const m = /^(\S+)\t(\S+)\t([\s\S]*)$/.exec(tokens[i]!)
+    if (m === null) continue
+    let path = m[3]!
+    if (path === '') {
+      path = tokens[i + 2] ?? ''
+      i += 2
+    }
+    entries.push({ path, binary: m[1] === '-' })
+  }
+  return entries
+}
+
+// 差分全体を、ファイルごとの区切り(行頭の `diff --git `)で分ける
+function splitSections(diff: string): string[] {
+  const starts = [...diff.matchAll(/^diff --git /gm)].map(m => m.index)
+  return starts.map((start, i) => diff.slice(start, starts[i + 1] ?? diff.length))
+}
+
+// 差分を分けて判定するときに各回へ渡す、変更されたファイルの一覧の上限(文字数)
+const CHANGED_BUDGET = 20_000
+
+// 各回に渡す、ブランチ全体の変更されたファイルの一覧。外したものには印を付け、長すぎれば先頭だけにする
+function changedList(paths: string[], skipped: Set<string>): string {
+  const lines: string[] = []
+  let used = 0
+  for (const [i, path] of paths.entries()) {
+    const line = skipped.has(path) ? `${path} (left out: does not affect the documentation)` : path
+    if (used + line.length + 1 > CHANGED_BUDGET) {
+      lines.push(`... and ${paths.length - i} more files`)
+      break
+    }
+    lines.push(line)
+    used += line.length + 1
+  }
+  return lines.join('\n')
+}
+
+// .gitattributes で linguist-generated・linguist-vendored が指定されたファイル。head 時点の .gitattributes で見る
+// (--source が使えない古い git では、作業ツリーのもの)。確かめられなければ空
+async function generatedFiles($: EngineInterface, root: string, head: string, paths: string[]): Promise<Set<string>> {
+  const out = new Set<string>()
+  if (paths.length === 0) return out
+  const attrs = ['linguist-generated', 'linguist-vendored']
+  for (const source of [['--source', head], []]) {
+    const r = await git($, ['check-attr', '-z', '--stdin', ...source, ...attrs], root, paths.join('\0') + '\0')
+    if (r === undefined) continue
+    // path・属性・値の 3 つずつ。値は set・true のときだけ外す
+    const fields = r.split('\0')
+    for (let i = 0; i + 2 < fields.length; i += 3) {
+      if (fields[i + 2] === 'set' || fields[i + 2] === 'true') out.add(fields[i]!)
+    }
+    return out
+  }
+  return out
+}
+
+// ファイルごとの差分を、順に budget まで詰めて、判定 1 回分ずつにまとめる
+function packPieces(pieces: Piece[], budget: number): Piece[] {
+  const parts: Piece[] = []
+  for (const p of pieces) {
+    const last = parts[parts.length - 1]
+    if (last !== undefined && last.diff.length + p.diff.length <= budget) {
+      last.files.push(...p.files)
+      last.diff += p.diff
+    } else {
+      parts.push({ files: [...p.files], diff: p.diff })
+    }
+  }
+  return parts
 }
 
 // 通したコマンドの結果に、Claude だけが読む一文を添える
@@ -211,15 +469,27 @@ function withNote(r: ToolCallResult<'Bash'>, note: string): ToolCallResult<'Bash
   return { ...r, context: [...(r.context ?? []), note] }
 }
 
-// git を cwd で実行し、成功したら stdout を返す
-async function git($: EngineInterface, args: string[], cwd: string): Promise<string | undefined> {
+// git の出力が 4 MiB を超えて切れたことを表す
+const TRUNCATED = Symbol('truncated')
+// 出力をそのまま返す(trim しない)git のサブコマンド
+const RAW_OUTPUT = new Set(['diff', 'show', 'check-attr'])
+
+// git を cwd で実行し、成功したら stdout を返す。出力が切れたら TRUNCATED、失敗したら undefined
+async function gitOut($: EngineInterface, args: string[], cwd: string, stdin?: string): Promise<string | typeof TRUNCATED | undefined> {
   try {
-    const r = await $.process.run(['git', ...args], { cwd })
-    if (r.exitCode !== 0 || r.isStdoutTruncated) return undefined
-    return args[0] === 'diff' || args[0] === 'show' ? r.stdout : r.stdout.trim()
+    const r = await $.process.run(['git', ...args], stdin === undefined ? { cwd } : { cwd, stdin })
+    if (r.exitCode !== 0) return undefined
+    if (r.isStdoutTruncated) return TRUNCATED
+    return RAW_OUTPUT.has(args[0]!) ? r.stdout : r.stdout.trim()
   } catch {
     return undefined
   }
+}
+
+// git を cwd で実行し、成功したら stdout を返す。出力が切れたときも失敗として扱う
+async function git($: EngineInterface, args: string[], cwd: string, stdin?: string): Promise<string | undefined> {
+  const out = await gitOut($, args, cwd, stdin)
+  return out === TRUNCATED ? undefined : out
 }
 
 // コマンド内の cd を順にたどり、gh pr create が実行される場所を求める
@@ -433,10 +703,9 @@ async function readDocs($: EngineInterface, root: string, head: string): Promise
   return docs
 }
 
-// 予算に収まればすべて渡す。収まらなければ、差分に関係しそうなドキュメントをモデルに選ばせる
-async function selectDocs($: EngineInterface, model: string, docs: Doc[], diff: string, changed: string, signal: AbortSignal): Promise<Doc[]> {
-  const total = diff.length + docs.reduce((n, d) => n + d.text.length, 0)
-  if (total <= PROMPT_BUDGET) return docs
+// room(ドキュメントに使える文字数)に収まればすべて渡す。収まらなければ、差分に関係しそうなドキュメントをモデルに選ばせる
+async function selectDocs($: EngineInterface, model: string, docs: Doc[], room: number, changed: string, signal: AbortSignal): Promise<Doc[]> {
+  if (docs.reduce((n, d) => n + d.text.length, 0) <= room) return docs
 
   const r = await $.model.complete(
     {
@@ -448,18 +717,18 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], diff: 
     },
     { signal },
   )
-  if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`)
+  if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`, [RETRY])
 
   const wanted = parseJson(r.text)
-  if (!Array.isArray(wanted)) throw new CheckFailed('could not read the model reply')
+  if (!Array.isArray(wanted)) throw new CheckFailed('could not read the model reply', [RETRY])
   const names = new Set(wanted.map(p => normalizePath(String(p))))
   const picked = docs.filter(d => names.has(d.path))
 
-  // 予算に入るものだけを渡す。入らない大きなものは飛ばし、後ろのものは続けて入れる
+  // room に入るものだけを渡す。入らない大きなものは飛ばし、後ろのものは続けて入れる
   const out: Doc[] = []
-  let used = diff.length
+  let used = 0
   for (const d of picked) {
-    if (used + d.text.length > PROMPT_BUDGET) continue
+    if (used + d.text.length > room) continue
     out.push(d)
     used += d.text.length
   }
@@ -468,19 +737,22 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], diff: 
   return out
 }
 
-// ずれの指摘を返す。ずれがなければ空
-async function judge($: EngineInterface, model: string, docs: Doc[], diff: string, signal: AbortSignal): Promise<Finding[]> {
+// 差分を分けて判定するときの、何回目か(index / count)と、ブランチ全体の変更されたファイルの一覧
+type PartContext = { index: number; count: number; changed: string }
+
+// ずれの指摘を返す。ずれがなければ空。part があれば、差分の一部として判定させる
+async function judge($: EngineInterface, model: string, docs: Doc[], diff: string, signal: AbortSignal, part?: PartContext): Promise<Finding[]> {
   const r = await $.model.complete(
     {
       model,
-      system: JUDGE_SYSTEM,
-      prompt: judgePrompt(docs, diff),
+      system: part === undefined ? JUDGE_SYSTEM : `${JUDGE_SYSTEM}\n\n${JUDGE_PART}`,
+      prompt: judgePrompt(docs, diff, part),
       maxTokens: MAX_TOKENS,
       timeoutMs: JUDGE_TIMEOUT_MS,
     },
     { signal },
   )
-  if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`)
+  if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`, [RETRY])
 
   const v = parseJson(r.text) as { status?: unknown; findings?: unknown } | undefined
   if (v?.status === 'ok') return []
@@ -491,16 +763,18 @@ async function judge($: EngineInterface, model: string, docs: Doc[], diff: strin
       fix: String(f?.fix ?? ''),
     }))
   }
-  throw new CheckFailed('could not read the model reply')
+  throw new CheckFailed('could not read the model reply', [RETRY])
 }
 
-// 判定できなかったとき、続けるかをユーザーに聞く。答えられない(-p 実行・閉じた)ときは中止
-async function confirmAfterFailure($: EngineInterface, action: Action, reason: string): Promise<boolean> {
+// 判定できなかったとき、続けるかをユーザーに聞く。答えられない(-p 実行・閉じた)ときは中止。
+// 差分の一部だけを判定できなかったときは、そのファイルを示す
+async function confirmAfterFailure($: EngineInterface, action: Action, failed: CheckFailed): Promise<boolean> {
+  const question =
+    failed.files.length > 0
+      ? `docs-sync: 差分が大きく、一部のファイルで実装とドキュメントの差異を確認できませんでした(${failed.message})。確認できなかったファイル: ${listFiles(failed.files, n => ` ほか ${n} 件`)}。${action.ask}`
+      : `docs-sync: 実装とドキュメントの差異を確認できませんでした(${failed.message})。${action.ask}`
   try {
-    const answer = await $.ui.ask(
-      `docs-sync: 実装とドキュメントの差異を確認できませんでした(${reason})。${action.ask}`,
-      { header: 'docs-sync', options: [action.proceed, ASK_CANCEL] },
-    )
+    const answer = await $.ui.ask(question, { header: 'docs-sync', options: [action.proceed, ASK_CANCEL] })
     return answer === action.proceed
   } catch {
     return false
@@ -972,13 +1246,25 @@ function normalizePath(path: string): string {
   return path.trim().replace(/^\.\//, '')
 }
 
-export function driftDeny(action: Action, findings: Finding[]): string {
+// ファイルの一覧を、長くなりすぎないように先頭の 10 件までにして並べる
+function listFiles(files: string[], more = (n: number) => ` and ${n} more`): string {
+  const shown = files.slice(0, 10).join(', ')
+  return files.length > 10 ? `${shown}${more(files.length - 10)}` : shown
+}
+
+export function driftDeny(action: Action, findings: Finding[], unchecked: string[] = []): string {
   const lines = findings.map(f => `- ${f.doc}: ${f.issue}${f.fix ? ` (suggested fix: ${f.fix})` : ''}`)
+  // 一部を判定できなかったときも、判定できた部分のずれをまとめて伝える
+  const partial =
+    unchecked.length > 0
+      ? ['', `The diff was too large to check in full, so these changed files were not checked: ${listFiles(unchecked)}. The findings above come from the rest of the diff.`]
+      : []
   return [
     `docs-sync: ${action.blocked} because the documentation does not match the implementation on this branch.`,
     '',
     'Findings:',
     ...lines,
+    ...partial,
     '',
     'What to do:',
     '1. Update the documentation to match the implementation.',
@@ -1003,10 +1289,15 @@ export function failureNote(action: Action, reason: string): string {
   return `docs-sync: the documentation check could not run before this ${action.command} (${reason}), and the user chose to go ahead anyway. The documentation was not verified against the implementation.`
 }
 
-export function failureDeny(action: Action, reason: string): string {
+export function failureDeny(action: Action, reason: string, hints: Hint[] = []): string {
   return [
     `docs-sync: ${action.blocked} because the documentation check could not run (${reason}).`,
-    'Tell the user what happened and ask how to proceed. Do not try to get around this check.',
+    'This does not mean that the documentation is out of date: docs-sync could not finish the check.',
+    '',
+    'Tell the user what happened, and offer these options:',
+    ...[...hints, BY_HAND].map(h => `- ${h(action)}`),
+    '',
+    'Do not try to get around this check yourself.',
   ].join('\n')
 }
 
@@ -1033,9 +1324,16 @@ const SELECT_SYSTEM = `You pick which documents might need an update for a code 
 
 Reply with a JSON array of document paths only, exactly as listed, no prose. Include project instruction files (such as CLAUDE.md or AGENTS.md) and any document that describes the changed files, their behavior, or lists the components they belong to.`
 
-function judgePrompt(docs: Doc[], diff: string): string {
+// 差分を分けて判定するときに、JUDGE_SYSTEM に足す
+const JUDGE_PART = `The branch's diff is too large for one check, so it is split into parts, and you get one of them. The other parts are checked separately.
+The <changed-files> list covers the whole branch. The documents are as of the branch head, so they already include any documentation changes made in other parts.
+Report only findings about the changes in your part of the diff.`
+
+function judgePrompt(docs: Doc[], diff: string, part?: PartContext): string {
   const docBlocks = docs.map(d => `<document path="${d.path}">\n${d.text}\n</document>`).join('\n\n')
-  return `<diff>\n${diff}\n</diff>\n\n<documents>\n${docBlocks}\n</documents>`
+  const head = part === undefined ? '' : `<changed-files>\n${part.changed}\n</changed-files>\n\n<part index="${part.index}" of="${part.count}">\n`
+  const tail = part === undefined ? '' : '\n</part>'
+  return `${head}<diff>\n${diff}\n</diff>${tail}\n\n<documents>\n${docBlocks}\n</documents>`
 }
 
 function selectPrompt(docs: Doc[], changed: string): string {
