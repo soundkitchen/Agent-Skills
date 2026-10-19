@@ -23,7 +23,7 @@ const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName
 // gh repo view は、-R の指定がなければ o/r を返す(既定のブランチは defaultBranch、省略すると main)。ghRepoFails なら失敗する。
 // unfetched なら upstream/main はまだ fetch していない。partial は partial clone の remote の名前
 // files はファイルごとの差分(差分全体はそれをつなげたもの)。binary はバイナリ、generated は linguist-generated のファイル。
-// truncated なら、差分全体の出力が 4 MiB を超えて切れる
+// truncated なら、差分全体の出力が 4 MiB を超えて切れる。unreadable はファイルごとの差分を取れないファイル
 function world(
   on: On,
   opts: {
@@ -40,6 +40,7 @@ function world(
     binary?: string[]
     generated?: string[]
     truncated?: boolean
+    unreadable?: string[]
     model: Model
   },
 ) {
@@ -103,11 +104,11 @@ function world(
       if (opts.truncated === true) return { value: { ...ok('+ cut').value, isStdoutTruncated: true } }
       return ok(opts.diff ?? (opts.files !== undefined ? Object.values(opts.files).join('') : '+ renamed --fast to --quick\n'))
     }
-    if (/^diff --numstat -z --no-renames \S+$/.test(sub)) {
+    if (/^diff --numstat -z (--no-renames )?\S+$/.test(sub)) {
       return ok(Object.keys(opts.files ?? {}).map(f => `${opts.binary?.includes(f) === true ? '-\t-' : '1\t0'}\t${f}\0`).join(''))
     }
     const one = /^diff --no-color --no-renames \S+ -- :\(literal\)(.+)$/.exec(sub)
-    if (one !== null) return ok(opts.files?.[one[1]!] ?? '')
+    if (one !== null) return opts.unreadable?.includes(one[1]!) === true ? fail : ok(opts.files?.[one[1]!] ?? '')
     if (args[0] === 'check-attr') {
       const paths = (e.init?.stdin ?? '').split('\0').filter(f => f !== '')
       const generated = (f: string) => (opts.generated?.includes(f) === true ? 'set' : 'unspecified')
@@ -383,8 +384,10 @@ describe('docs-sync', () => {
   })
 })
 
-// 1 つ 100,000 文字の差分。2 つで 1 回の判定に入る
-const big = (name: string) => `diff --git a/${name} b/${name}\n+ ${name} ${'x'.repeat(100_000)}\n`
+// ファイル 1 つ分の差分
+const section = (name: string, body: string) => `diff --git a/${name} b/${name}\n${body}`
+// 1 つ 100,000 文字ほどの差分。2 つで 1 回の判定に入る
+const big = (name: string, size = 100_000) => section(name, `+ ${name} ${'x'.repeat(size)}\n`)
 // 判定のプロンプトに含まれる、差分を分けたときの何回目か
 const partOf = (prompt: string) => /<part index="(\d+)"/.exec(prompt)?.[1]
 
@@ -400,6 +403,21 @@ describe('docs-sync on a large diff', () => {
     expect(prompts.map(partOf)).toEqual(['1', '2'])
     expect(prompts[0]).toContain('<changed-files>')
     expect(r.context?.[0]).toContain('in 2 parts')
+    // 差分全体を取れているので、ファイルごとに git diff を実行し直さない
+    expect(calls.git.some(g => g.includes(':(literal)'))).toBe(false)
+  })
+
+  test('splits a diff just under the budget instead of leaving no room for the documents', async ($, on) => {
+    const prompts: string[] = []
+    const calls = world(on, {
+      files: { 'src/a.ts': big('a', 140_000), 'src/b.ts': big('b', 140_000) },
+      docs: { 'README.md': '# Tool\n' + 'd'.repeat(30_000) },
+      model: prompt => (prompts.push(prompt), { text: '{"status":"ok"}' }),
+    })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual(['gh pr create --fill'])
+    expect(prompts.map(partOf)).toEqual(['1', '2'])
+    expect(r.context?.[0]).toContain('against 1 of 1 documents')
   })
 
   test('leaves out lock files, generated files and binaries', async ($, on) => {
@@ -410,7 +428,7 @@ describe('docs-sync on a large diff', () => {
         'dist/app.js': big('dist'),
         'logo.png': big('png'),
         'pnpm-lock.yaml': big('pnpm'),
-        'src/cli.ts': '+ renamed --fast to --quick\n',
+        'src/cli.ts': section('src/cli.ts', '+ renamed --fast to --quick\n'),
       },
       binary: ['logo.png'],
       generated: ['dist/app.js'],
@@ -421,6 +439,8 @@ describe('docs-sync on a large diff', () => {
     expect(prompts.length).toBe(1)
     expect(prompts[0]).toContain('renamed --fast to --quick')
     expect(prompts[0]).not.toContain('xxxxxxxxxx')
+    // 外した後は 1 回で済むので、分けて判定しているとは伝えない
+    expect(prompts[0]).not.toContain('<part')
     expect(r.context?.[0]).toContain('leaving out 4 files')
   })
 
@@ -447,7 +467,7 @@ describe('docs-sync on a large diff', () => {
 
   test('asks the user about the files it could not check, and remembers the choice for the commit', async ($, on) => {
     const questions: string[] = []
-    const calls = world(on, { files: { 'src/a.ts': big('a'), 'src/huge.ts': `+ ${'y'.repeat(160_000)}\n`, 'src/b.ts': big('b') }, model: OK })
+    const calls = world(on, { files: { 'src/a.ts': big('a'), 'src/huge.ts': big('huge', 310_000), 'src/b.ts': big('b') }, model: OK })
     on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
       const question = e.questions[0]!.question
       questions.push(question)
@@ -480,7 +500,7 @@ describe('docs-sync on a large diff', () => {
   })
 
   test('reports the drift it found together with the files it could not check', async ($, on) => {
-    const calls = world(on, { files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/huge.ts': `+ ${'y'.repeat(160_000)}\n` }, model: DRIFT })
+    const calls = world(on, { files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/huge.ts': big('huge', 310_000) }, model: DRIFT })
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual([])
     expect(r.deny).toContain('says --fast but the CLI now takes --quick')
@@ -497,6 +517,35 @@ describe('docs-sync on a large diff', () => {
     expect(calls.model).toBe(2)
     expect(r.deny).toContain('a part failed: model call failed (empty-reply)')
     expect(r.deny).toContain(`Run gh pr create again`)
+  })
+
+  test('tells Claude to run again, not that the file is too large, when git diff fails for a file', async ($, on) => {
+    const calls = world(on, {
+      files: { 'src/a.ts': section('src/a.ts', '+ a\n'), 'src/b.ts': section('src/b.ts', '+ b\n') },
+      truncated: true,
+      unreadable: ['src/b.ts'],
+      model: OK,
+    })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual([])
+    expect(r.deny).toContain('git diff failed for 1')
+    expect(r.deny).not.toContain('too large to check on their own')
+    expect(r.deny).toContain('Run gh pr create again')
+  })
+
+  test('does not remember the choice to go ahead after a failure that may be temporary', async ($, on) => {
+    const questions: string[] = []
+    const calls = world(on, { model: () => ({ reason: 'empty-reply' }) })
+    on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+      const question = e.questions[0]!.question
+      questions.push(question)
+      return { result: { questions: e.questions, answers: { [question]: 'このまま PR を作成する' } } }
+    })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran.length).toBe(2)
+    expect(calls.model).toBe(2)
+    expect(questions.length).toBe(2)
   })
 })
 

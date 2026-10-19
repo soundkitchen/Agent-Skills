@@ -61,7 +61,8 @@ const BY_HAND: Hint = a =>
 const fetchBase = (remote: string): Hint => () => `Fetch the base branch (git fetch ${remote}) and run again.`
 
 // 判定できなかったことを表す。ユーザーに続けるか聞く。
-// hints は止めたときに示す手段、files は判定できなかったファイル、skip はユーザーが続けることを選んだときに記録する先
+// hints は止めたときに示す手段、files は判定できなかったファイル、
+// skip はユーザーが続けることを選んだときに記録する先(もう一度実行しても判定できない、差分が大きすぎるときだけ)
 class CheckFailed extends Error {
   hints: Hint[]
   files: string[]
@@ -88,13 +89,15 @@ export const register: Register = on => {
       const reason = err instanceof Error ? err.message : String(err)
       const failed = err instanceof CheckFailed ? err : new CheckFailed(reason)
       if (!(await confirmAfterFailure($, action, failed))) return { deny: failureDeny(action, reason, failed.hints) }
-      // 続けることを選んだコミットは、同じ base でもう一度判定しない(記録できなくても続ける)
-      if (failed.skip !== undefined) {
+      const r = await next(e)
+      // 差分が大きすぎて判定しきれなかったコミットで続けることを選び、コマンドが実行されたら、
+      // 同じ base ではもう判定しない(記録できなくても続ける)
+      if (failed.skip !== undefined && r.deny === undefined) {
         try {
           await $.store.set(failed.skip.key, failed.skip.head)
         } catch {}
       }
-      return withNote(await next(e), failureNote(action, reason))
+      return withNote(r, failureNote(action, reason))
     }
 
     // 開いている PR がないブランチへの push は、判定しない(PR を作るときに判定する)
@@ -209,10 +212,9 @@ async function resolveRoot($: EngineInterface, cds: string[]): Promise<string> {
   return root
 }
 
-// base...head の差分とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる。
-// ユーザーが続けることを選んだら、このコミットを記録して、同じ base ではもう判定しない
+// base...head の差分とドキュメントを比べ、結果を返す。判定できなければ CheckFailed を投げる
 async function check($: EngineInterface, root: string, base: string, head: string, signal: AbortSignal): Promise<Verdict> {
-  // 同じ base で最後に通ったコミット、または続けることが選ばれたコミットと同じなら判定し直さない
+  // 同じ base で最後に通ったコミット、または判定しきれずに続けることが選ばれたコミットと同じなら判定し直さない
   const cacheKey = `pass:${root}:${base}`
   const skipKey = `skip:${root}:${base}`
   const short = head.slice(0, 7)
@@ -223,36 +225,27 @@ async function check($: EngineInterface, root: string, base: string, head: strin
     return { status: 'ok', detail: `the user already chose to go ahead without a full check for commit ${short} against ${base}, so it was not checked again` }
   }
 
-  try {
-    const v = await compare($, root, base, head, signal)
-    if (v.status === 'ok' && v.checked) {
-      // 記録できなくても判定結果は変えない(次回また判定するだけ)
-      try {
-        await $.store.set(cacheKey, head)
-      } catch {}
-    }
-    return v.status === 'ok' ? { status: 'ok', detail: v.detail } : v
-  } catch (err) {
-    if (err instanceof CheckFailed) err.skip = { key: skipKey, head }
-    throw err
+  const v = await compare($, root, base, head, { key: skipKey, head }, signal)
+  if (v.status === 'ok' && v.checked) {
+    // 記録できなくても判定結果は変えない(次回また判定するだけ)
+    try {
+      await $.store.set(cacheKey, head)
+    } catch {}
   }
+  return v.status === 'ok' ? { status: 'ok', detail: v.detail } : v
 }
 
-// 判定する差分のかたまり。files は含まれるファイル(差分全体を 1 つで渡すときは空)
+// 判定する差分のかたまり。files は含まれるファイル
 type Piece = { files: string[]; diff: string }
+type Compared = { status: 'ok'; detail: string; checked: boolean } | Extract<Verdict, { status: 'drift' }>
 
-// check の本体。checked は、モデルで判定してずれがなかったか(差分やドキュメントがなくて通したときは false)
-async function compare(
-  $: EngineInterface,
-  root: string,
-  base: string,
-  head: string,
-  signal: AbortSignal,
-): Promise<{ status: 'ok'; detail: string; checked: boolean } | Extract<Verdict, { status: 'drift' }>> {
+// check の本体。checked は、モデルで判定してずれがなかったか(差分やドキュメントがなくて通したときは false)。
+// skip は、差分が大きすぎて判定しきれなかったときに、ユーザーが続けることを選んだら記録する先
+async function compare($: EngineInterface, root: string, base: string, head: string, skip: { key: string; head: string }, signal: AbortSignal): Promise<Compared> {
   const range = `${base}...${head}`
   const short = head.slice(0, 7)
-  // 差分全体が 4 MiB を超えて切れたときも、ファイルごとに分けて判定する
-  const whole = await diffOf($, root, [range])
+  // 差分全体が 4 MiB を超えて切れたときも、ファイルごとに取り直して分けて判定する
+  const whole = await gitOut($, ['diff', '--no-color', range], root)
   if (whole === undefined) throw new CheckFailed(`git diff ${range} failed`, [RETRY])
   if (whole !== TRUNCATED && whole.trim() === '') {
     return { status: 'ok', detail: `there is no diff between ${base} and ${short}, so there was nothing to check`, checked: false }
@@ -263,38 +256,48 @@ async function compare(
     return { status: 'ok', detail: `the repository has no Markdown documents at ${short}, so there was nothing to check`, checked: false }
   }
 
-  // 差分全体が予算に入れば、そのまま 1 回で判定する。入らなければ、ドキュメントに関係しないファイルを外し、ファイルごとに分ける
-  const fits = whole !== TRUNCATED && whole.length <= PROMPT_BUDGET
-  const files = fits ? undefined : await fileDiffs($, root, range, head)
-  const pieces: Piece[] = fits ? [{ files: [], diff: whole }] : files!.pieces
-  const unchecked = fits ? [] : [...files!.tooLarge]
-  if (pieces.length === 0 && unchecked.length === 0) {
-    return { status: 'ok', detail: `the diff ${base}...${short} only changes files that do not affect the documentation (such as lock files, generated files and binaries), so there was nothing to check`, checked: false }
-  }
-
   // 実装を読む判定なので、作業中のセッションと同じモデルで見る
   const model = await $.session.model()
-  const changed = (await git($, ['diff', '--name-only', range], root)) ?? ''
-  const total = pieces.reduce((n, p) => n + p.diff.length, 0)
-  // 分けるときは、ドキュメントに予算の半分までを使い、残りに差分を詰める
-  const room = PROMPT_BUDGET - (fits ? total : Math.min(total, PROMPT_BUDGET / 2))
-  const selected = pieces.length > 0 ? await selectDocs($, model, docs, room, changed, signal) : []
-  // 分けるときは、各回に変更されたファイルの一覧も渡すので、その分も差し引く
-  const parts = packPieces(pieces, PROMPT_BUDGET - selected.reduce((n, d) => n + d.text.length, 0) - (fits ? 0 : changed.length))
-  unchecked.push(...parts.slice(MAX_PARTS).flatMap(p => p.files))
+  // 差分全体とドキュメントが予算に入るか、差分全体が予算の半分までなら、1 回で判定する(入らないドキュメントは選ばせる)
+  if (whole !== TRUNCATED && (whole.length + sizeOf(docs) <= PROMPT_BUDGET || whole.length <= PROMPT_BUDGET / 2)) {
+    const changed = (await git($, ['diff', '--name-only', range], root)) ?? ''
+    const selected = await selectDocs($, model, docs, PROMPT_BUDGET - whole.length, changed, signal)
+    const findings = await judge($, model, selected, whole, signal)
+    if (findings.length > 0) return { status: 'drift', findings, unchecked: [] }
+    const checked = `checked the diff ${base}...${short} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
+    return { status: 'ok', detail: checked, checked: true }
+  }
+
+  // 入らなければ、ドキュメントに関係しないファイルを外し、ファイルごとの差分を詰めて分ける
+  const files = await fileDiffs($, root, range, head, whole)
+  if (files.pieces.length === 0 && files.huge.length === 0 && files.unreadable.length === 0) {
+    return { status: 'ok', detail: `the diff ${base}...${short} only changes files that do not affect the documentation (such as lock files, generated files and binaries), so there was nothing to check`, checked: false }
+  }
+  // 各回に変更されたファイルの一覧も渡すので、その分を除いた残りを、ドキュメントと差分で分ける。
+  // ドキュメントには、差分が入りきらないときでも半分までを使う
+  const changed = changedList(files.paths, files.skipped)
+  const avail = PROMPT_BUDGET - changed.length
+  const total = files.pieces.reduce((n, p) => n + p.diff.length, 0)
+  const selected = files.pieces.length > 0 ? await selectDocs($, model, docs, avail - Math.min(total, avail / 2), changed, signal) : []
+  const budget = avail - sizeOf(selected)
+  // 1 つで 1 回分に入らないファイルは判定できない
+  const tooLarge = [...files.huge, ...files.pieces.filter(p => p.diff.length > budget).flatMap(p => p.files)]
+  const parts = packPieces(files.pieces.filter(p => p.diff.length <= budget), budget)
+  const judged = parts.slice(0, MAX_PARTS)
+  const unchecked = [...tooLarge, ...files.unreadable, ...parts.slice(MAX_PARTS).flatMap(p => p.files)]
 
   // ずれが見つかっても、残りの部分も最後まで判定して、まとめて伝える
-  const judged = parts.slice(0, MAX_PARTS)
   const findings: Finding[] = []
   const failures: string[] = []
   try {
     for (const [i, part] of judged.entries()) {
       if (judged.length > 1) showStatus($, `docs-sync: 差分を分けて確認しています(${i + 1}/${judged.length})`)
-      const context = fits ? undefined : { index: i + 1, count: judged.length, changed }
+      // 1 回で済むなら、分けていることは伝えない(ほかのファイルについての指摘を控えさせないため)
+      const context = judged.length > 1 ? { index: i + 1, count: judged.length, changed } : undefined
       try {
         findings.push(...(await judge($, model, selected, part.diff, signal, context)))
       } catch (err) {
-        if (!(err instanceof CheckFailed) || fits) throw err
+        if (!(err instanceof CheckFailed)) throw err
         failures.push(err.message)
         unchecked.push(...part.files)
       }
@@ -306,22 +309,31 @@ async function compare(
   if (findings.length > 0) return { status: 'drift', findings, unchecked }
   if (unchecked.length > 0) {
     const why = [
-      ...(files?.tooLarge.length ? [`${files.tooLarge.length} too large to check on their own`] : []),
+      ...(tooLarge.length > 0 ? [`${tooLarge.length} too large to check on their own`] : []),
+      ...(files.unreadable.length > 0 ? [`git diff failed for ${files.unreadable.length}`] : []),
       ...(parts.length > MAX_PARTS ? [`the diff needed ${parts.length} parts and only ${MAX_PARTS} are checked`] : []),
       ...failures.map(f => `a part failed: ${f}`),
     ].join('; ')
     const rest = failures.length < judged.length ? ', and the rest has no mismatch' : ''
-    throw new CheckFailed(
+    // 一時的な失敗があれば、もう一度実行すれば判定できるかもしれないので、続けることを選んでも記録しない
+    const transient = files.unreadable.length > 0 || failures.length > 0
+    const err = new CheckFailed(
       `the diff is too large to check in full: ${unchecked.length} changed files could not be checked (${why})${rest}`,
-      failures.length > 0 ? [RETRY, SPLIT_PR, DISABLE] : [SPLIT_PR, DISABLE],
+      transient ? [RETRY, SPLIT_PR, DISABLE] : [SPLIT_PR, DISABLE],
       unchecked,
     )
+    if (!transient) err.skip = skip
+    throw err
   }
 
   const how = judged.length > 1 ? ` in ${judged.length} parts` : ''
-  const skipped = files !== undefined && files.skipped.length > 0 ? ` (leaving out ${files.skipped.length} files that do not affect the documentation, such as lock files)` : ''
-  const checked = `checked the diff ${base}...${short}${how}${skipped} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
+  const left = files.skipped.size > 0 ? ` (leaving out ${files.skipped.size} files that do not affect the documentation, such as lock files)` : ''
+  const checked = `checked the diff ${base}...${short}${how}${left} against ${selected.length} of ${docs.length} documents and found no mismatch between the implementation and the documentation`
   return { status: 'ok', detail: checked, checked: true }
+}
+
+function sizeOf(docs: Doc[]): number {
+  return docs.reduce((n, d) => n + d.text.length, 0)
 }
 
 // 進み具合をプロンプトの下に出す(undefined で消す)。出せなくても判定は続ける
@@ -331,44 +343,90 @@ function showStatus($: EngineInterface, text: string | undefined): void {
   } catch {}
 }
 
-// git diff の出力が 4 MiB を超えて切れたことを表す
-const TRUNCATED = Symbol('truncated')
+// 変更されたファイル 1 つ。binary は、numstat で行数が出ない(バイナリの)もの
+type FileEntry = { path: string; binary: boolean }
 
-// git diff --no-color を実行し、差分を返す。出力が切れたら TRUNCATED、失敗したら undefined
-async function diffOf($: EngineInterface, root: string, args: string[]): Promise<string | typeof TRUNCATED | undefined> {
-  try {
-    const r = await $.process.run(['git', 'diff', '--no-color', ...args], { cwd: root })
-    if (r.exitCode !== 0) return undefined
-    return r.isStdoutTruncated ? TRUNCATED : r.stdout
-  } catch {
-    return undefined
+// 差分をファイルごとに分ける。差分全体を取れていれば、ファイルの境目で分ける(numstat は差分全体と同じ順・同じ rename の扱いで並ぶ)。
+// 切れていた、または numstat と数が合わないときは、rename を削除と追加として扱い、ファイルごとに取り直す。
+// paths は変更されたすべてのファイル、skipped はドキュメントに関係しないので外したもの、
+// huge は 1 つで 4 MiB を超えたもの、unreadable は差分を取れなかったもの
+async function fileDiffs(
+  $: EngineInterface,
+  root: string,
+  range: string,
+  head: string,
+  whole: string | typeof TRUNCATED,
+): Promise<{ paths: string[]; pieces: Piece[]; skipped: Set<string>; huge: string[]; unreadable: string[] }> {
+  let entries: FileEntry[] | undefined
+  let sections: string[] = []
+  if (whole !== TRUNCATED) {
+    entries = await numstat($, root, [range])
+    sections = splitSections(whole)
+    if (sections.length !== entries.length) entries = undefined
   }
-}
+  const byFile = entries === undefined
+  entries ??= await numstat($, root, ['--no-renames', range])
 
-// 差分をファイルごとに取る。ドキュメントに関係しないファイルは skipped に、1 つで予算の半分を超えるもの
-// (または差分を取れなかったもの)は tooLarge に入れる。pieces はパスの順なので、同じディレクトリのものが並ぶ
-async function fileDiffs($: EngineInterface, root: string, range: string, head: string): Promise<{ pieces: Piece[]; skipped: string[]; tooLarge: string[] }> {
-  // 分けて取るので、rename は削除と追加として扱う
-  const stat = await git($, ['diff', '--numstat', '-z', '--no-renames', range], root)
-  if (stat === undefined) throw new CheckFailed(`git diff --numstat ${range} failed`, [RETRY])
-  const entries = stat.split('\0').flatMap(record => {
-    const m = /^(\S+)\t(\S+)\t([\s\S]+)$/.exec(record)
-    return m === null ? [] : [{ path: m[3]!, binary: m[1] === '-' }]
-  })
   const generated = await generatedFiles($, root, head, entries.map(e => e.path))
   const pieces: Piece[] = []
-  const skipped: string[] = []
-  const tooLarge: string[] = []
-  for (const { path, binary } of [...entries].sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))) {
+  const skipped = new Set<string>()
+  const huge: string[] = []
+  const unreadable: string[] = []
+  for (const [i, { path, binary }] of entries.entries()) {
     if (binary || SKIP_FILE.test(path) || generated.has(path)) {
-      skipped.push(path)
+      skipped.add(path)
       continue
     }
-    const diff = await diffOf($, root, ['--no-renames', range, '--', `:(literal)${path}`])
-    if (diff === undefined || diff === TRUNCATED || diff.length > PROMPT_BUDGET / 2) tooLarge.push(path)
+    const diff = byFile ? await gitOut($, ['diff', '--no-color', '--no-renames', range, '--', `:(literal)${path}`], root) : sections[i]!
+    if (diff === undefined) unreadable.push(path)
+    else if (diff === TRUNCATED) huge.push(path)
     else if (diff.trim() !== '') pieces.push({ files: [path], diff })
   }
-  return { pieces, skipped, tooLarge }
+  return { paths: entries.map(e => e.path), pieces, skipped, huge, unreadable }
+}
+
+// git diff --numstat -z の結果。rename・copy は、パスが空で、続く 2 つが元と先のパスになるので、先のパスを使う
+async function numstat($: EngineInterface, root: string, args: string[]): Promise<FileEntry[]> {
+  const out = await git($, ['diff', '--numstat', '-z', ...args], root)
+  if (out === undefined) throw new CheckFailed(`git diff --numstat ${args.join(' ')} failed`, [RETRY])
+  const tokens = out.split('\0')
+  const entries: FileEntry[] = []
+  for (let i = 0; i < tokens.length; i++) {
+    const m = /^(\S+)\t(\S+)\t([\s\S]*)$/.exec(tokens[i]!)
+    if (m === null) continue
+    let path = m[3]!
+    if (path === '') {
+      path = tokens[i + 2] ?? ''
+      i += 2
+    }
+    entries.push({ path, binary: m[1] === '-' })
+  }
+  return entries
+}
+
+// 差分全体を、ファイルごとの区切り(行頭の `diff --git `)で分ける
+function splitSections(diff: string): string[] {
+  const starts = [...diff.matchAll(/^diff --git /gm)].map(m => m.index)
+  return starts.map((start, i) => diff.slice(start, starts[i + 1] ?? diff.length))
+}
+
+// 差分を分けて判定するときに各回へ渡す、変更されたファイルの一覧の上限(文字数)
+const CHANGED_BUDGET = 20_000
+
+// 各回に渡す、ブランチ全体の変更されたファイルの一覧。外したものには印を付け、長すぎれば先頭だけにする
+function changedList(paths: string[], skipped: Set<string>): string {
+  const lines: string[] = []
+  let used = 0
+  for (const [i, path] of paths.entries()) {
+    const line = skipped.has(path) ? `${path} (left out: does not affect the documentation)` : path
+    if (used + line.length + 1 > CHANGED_BUDGET) {
+      lines.push(`... and ${paths.length - i} more files`)
+      break
+    }
+    lines.push(line)
+    used += line.length + 1
+  }
+  return lines.join('\n')
 }
 
 // .gitattributes で linguist-generated・linguist-vendored が指定されたファイル。head 時点の .gitattributes で見る
@@ -378,16 +436,14 @@ async function generatedFiles($: EngineInterface, root: string, head: string, pa
   if (paths.length === 0) return out
   const attrs = ['linguist-generated', 'linguist-vendored']
   for (const source of [['--source', head], []]) {
-    try {
-      const r = await $.process.run(['git', 'check-attr', '-z', '--stdin', ...source, ...attrs], { cwd: root, stdin: paths.join('\0') + '\0' })
-      if (r.exitCode !== 0 || r.isStdoutTruncated) continue
-      // path・属性・値の 3 つずつ。値は set・true のときだけ外す
-      const fields = r.stdout.split('\0')
-      for (let i = 0; i + 2 < fields.length; i += 3) {
-        if (fields[i + 2] === 'set' || fields[i + 2] === 'true') out.add(fields[i]!)
-      }
-      return out
-    } catch {}
+    const r = await git($, ['check-attr', '-z', '--stdin', ...source, ...attrs], root, paths.join('\0') + '\0')
+    if (r === undefined) continue
+    // path・属性・値の 3 つずつ。値は set・true のときだけ外す
+    const fields = r.split('\0')
+    for (let i = 0; i + 2 < fields.length; i += 3) {
+      if (fields[i + 2] === 'set' || fields[i + 2] === 'true') out.add(fields[i]!)
+    }
+    return out
   }
   return out
 }
@@ -413,15 +469,27 @@ function withNote(r: ToolCallResult<'Bash'>, note: string): ToolCallResult<'Bash
   return { ...r, context: [...(r.context ?? []), note] }
 }
 
-// git を cwd で実行し、成功したら stdout を返す
-async function git($: EngineInterface, args: string[], cwd: string): Promise<string | undefined> {
+// git の出力が 4 MiB を超えて切れたことを表す
+const TRUNCATED = Symbol('truncated')
+// 出力をそのまま返す(trim しない)git のサブコマンド
+const RAW_OUTPUT = new Set(['diff', 'show', 'check-attr'])
+
+// git を cwd で実行し、成功したら stdout を返す。出力が切れたら TRUNCATED、失敗したら undefined
+async function gitOut($: EngineInterface, args: string[], cwd: string, stdin?: string): Promise<string | typeof TRUNCATED | undefined> {
   try {
-    const r = await $.process.run(['git', ...args], { cwd })
-    if (r.exitCode !== 0 || r.isStdoutTruncated) return undefined
-    return args[0] === 'diff' || args[0] === 'show' ? r.stdout : r.stdout.trim()
+    const r = await $.process.run(['git', ...args], stdin === undefined ? { cwd } : { cwd, stdin })
+    if (r.exitCode !== 0) return undefined
+    if (r.isStdoutTruncated) return TRUNCATED
+    return RAW_OUTPUT.has(args[0]!) ? r.stdout : r.stdout.trim()
   } catch {
     return undefined
   }
+}
+
+// git を cwd で実行し、成功したら stdout を返す。出力が切れたときも失敗として扱う
+async function git($: EngineInterface, args: string[], cwd: string, stdin?: string): Promise<string | undefined> {
+  const out = await gitOut($, args, cwd, stdin)
+  return out === TRUNCATED ? undefined : out
 }
 
 // コマンド内の cd を順にたどり、gh pr create が実行される場所を求める
