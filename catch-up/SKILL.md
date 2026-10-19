@@ -43,16 +43,18 @@ This skill only reads and proposes. Do not commit, push, create or switch branch
 
 `gh issue list` and `gh pr list` return only 30 items by default, newest created first: pass a `--limit` large enough for all open ones (e.g. `--limit 500`) and `--json number,title,labels,updatedAt`, and sort by `updatedAt` yourself. If the result reaches the limit, say that the list may be cut. If there are many open Issues (more than about 20), read the titles of all and the details of the 10 most recently updated, and say that you did; the same for PRs, counted separately.
 
-**Open PRs in one query**: this gets the open PRs, most recently updated first, with their review state, CI state, and review threads. For each thread, the last comment is enough here; if a PR has more threads than one page (`hasNextPage`), get the rest as in "Unresolved review threads".
+**Open PRs in one query**: this gets the open PRs, most recently updated first, with their review state, CI state, latest conversation comments (where handoffs are left), and review threads. For each thread, the last comment is enough here; if a PR has more threads than one page (`reviewThreads.pageInfo.hasNextPage`), get the rest as in "Unresolved review threads". If there are more open PRs than one page (`pullRequests.pageInfo.hasNextPage`), say that the list may be cut; read a PR's older comments with `gh pr view <N> --comments` when the latest ones point to them.
 
 ```sh
 gh api graphql -F owner=<owner> -F name=<repo> -f query='
   query($owner: String!, $name: String!) {
     repository(owner: $owner, name: $name) {
-      pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
+      pullRequests(states: OPEN, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
+        pageInfo { hasNextPage }
         nodes {
           number title updatedAt author { login } reviewDecision mergeable
           commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+          comments(last: 3) { nodes { author { login } body createdAt } }
           reviewThreads(first: 100) {
             pageInfo { hasNextPage }
             nodes { isResolved isOutdated path comments(last: 1) { nodes { author { login } } } }
