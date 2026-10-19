@@ -14,9 +14,9 @@ The user is starting work in this session, and earlier sessions (or teammates) l
 
 Arguments given: `$ARGUMENTS`
 
-- **Empty**: catch up on the whole project (see "Catch up on the project")
-- **An Issue or PR number** (`#N`, `N`, or its URL): catch up on that one (see "Catch up on #N"). GitHub numbers Issues and PRs together, so find out which it is (`gh api repos/{owner}/{repo}/issues/<N>` has a `pull_request` field for a PR)
-- **Anything else**: free-form notes from the user (e.g. "影響範囲も見て", "docs は見なくていい"). They override the defaults below
+- **No number**: catch up on the whole project (see "Catch up on the project")
+- **An Issue or PR number** (`#N`, `N`, or its URL): catch up on that one (see "Catch up on #N"). A URL may point to another repository (e.g. the upstream of a fork): use the owner and repository in the URL; otherwise use the current repository. GitHub numbers Issues and PRs together, so find out which it is (`gh api repos/<owner>/<repo>/issues/<N>` has a `pull_request` field for a PR)
+- **Notes**: any other words are free-form notes from the user (e.g. "影響範囲も見て", "docs は見なくていい"). They can come together with a number (e.g. `#12 影響範囲も見て`): the number picks what to catch up on, and the rest are notes. Notes override the defaults below
 
 If the skill was invoked from a natural-language request and the arguments are empty, read the same information from the user's message (e.g. "#22 対応を進めます" → `#22`).
 
@@ -26,40 +26,61 @@ Read the project's rules first (CLAUDE.md, AGENTS.md, README, `docs/`): the bran
 
 ## Read only
 
-This skill only reads and proposes. Do not commit, push, create or switch branches, edit files, or post to Issues or PRs. The only change allowed is updating remote-tracking branches with `git fetch --prune`. Skip a check if it does not apply (e.g. not a git repository, `gh` not available or not authenticated, no remote), and say so in the summary.
+This skill only reads and proposes. Do not commit, push, create or switch branches, edit files, or post to Issues or PRs. The only change allowed is updating remote-tracking branches with `git fetch --prune`: run it once at the start, before comparing anything with the remote, so that upstreams and remote branches are current. Skip a check if it does not apply (e.g. not a git repository, `gh` not available or not authenticated, no remote), and say so in the summary.
 
 ## Catch up on the project
 
 ### 1. Read the state
 
 **Repository**
-- Current branch, uncommitted changes and untracked files, stashes, unpushed commits (compare each local branch with its upstream; a branch with no upstream counts as unpushed), worktrees (`git worktree list`). These may be left over from an earlier session: report them, do not touch them
+- Current branch, uncommitted changes and untracked files, stashes, worktrees (`git worktree list`), and unpushed commits: compare each local branch with its upstream, and count a branch with no upstream as unpushed. A branch whose upstream is gone after the fetch (`[gone]` in `git branch -vv`) is not unpushed: its remote branch was deleted, usually because its PR was merged. Report it separately as probably merged (check `gh pr list --state merged --head <branch>`). These may be left over from an earlier session: report them, do not touch them
 - Recent history of the default branch (e.g. the last 10-20 commits and merges), to see what was done last
 
 **Handoffs** (where wrap-up and teammates leave them)
-- Open PRs: what each does, review state, unresolved review threads (see "Unresolved review threads"), CI checks (`gh pr checks`), and the latest comments (a PR comment may describe where the work stands and the next step)
+- Open PRs: what each does, review state, unresolved review threads, CI checks, and the latest comments (a PR comment may describe where the work stands and the next step). Get them for all open PRs in one query (see "Open PRs in one query"), not one PR at a time
 - Open Issues: titles and labels of all of them; the body and recent comments of the recently updated ones
 - The task list the project keeps (TODO.md or similar), and recent changes to `docs/`
 
-`gh issue list` and `gh pr list` return only 30 items by default: pass a `--limit` large enough for all open ones (e.g. `--limit 500`), and if the result reaches the limit, say that the list may be cut. If there are many open Issues or PRs (more than about 20), read the titles of all and the details of the 10 most recently updated, and say that you did.
+`gh issue list` and `gh pr list` return only 30 items by default, newest created first: pass a `--limit` large enough for all open ones (e.g. `--limit 500`) and `--json number,title,labels,updatedAt`, and sort by `updatedAt` yourself. If the result reaches the limit, say that the list may be cut. If there are many open Issues (more than about 20), read the titles of all and the details of the 10 most recently updated, and say that you did; the same for PRs, counted separately.
 
-**Unresolved review threads**: the REST list of review comments does not say whether a thread is resolved, and returns 30 per page. Use GraphQL instead, paging through all threads, and count only those with `isResolved: false`:
+**Open PRs in one query**: this gets the open PRs, most recently updated first, with their review state, CI state, and review threads. For each thread, the last comment is enough here; if a PR has more threads than one page (`hasNextPage`), get the rest as in "Unresolved review threads".
 
 ```sh
-gh api graphql --paginate -F owner=<owner> -F name=<repo> -F number=<N> -f query='
-  query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+gh api graphql -F owner=<owner> -F name=<repo> -f query='
+  query($owner: String!, $name: String!) {
     repository(owner: $owner, name: $name) {
-      pullRequest(number: $number) {
-        reviewThreads(first: 100, after: $endCursor) {
-          pageInfo { hasNextPage endCursor }
-          nodes { isResolved isOutdated path line comments(first: 20) { nodes { author { login } body } } }
+      pullRequests(states: OPEN, first: 50, orderBy: {field: UPDATED_AT, direction: DESC}) {
+        nodes {
+          number title updatedAt author { login } reviewDecision mergeable
+          commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+          reviewThreads(first: 100) {
+            pageInfo { hasNextPage }
+            nodes { isResolved isOutdated path comments(last: 1) { nodes { author { login } } } }
+          }
         }
       }
     }
   }'
 ```
 
-A thread that is not resolved but has a reply from the PR author may already be addressed: say so instead of calling it unanswered.
+**Unresolved review threads** (for one PR): the REST list of review comments does not say whether a thread is resolved, and returns 30 per page. Use GraphQL instead, paging through all threads, and count only those with `isResolved: false`:
+
+```sh
+gh api graphql --paginate -F owner=<owner> -F name=<repo> -F number=<N> -f query='
+  query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+    repository(owner: $owner, name: $name) {
+      pullRequest(number: $number) {
+        author { login }
+        reviewThreads(first: 100, after: $endCursor) {
+          pageInfo { hasNextPage endCursor }
+          nodes { isResolved isOutdated path line comments(last: 20) { nodes { author { login } body } } }
+        }
+      }
+    }
+  }'
+```
+
+A thread that is not resolved but whose last comment is from the PR author may already be addressed: say so instead of calling it unanswered. If the reviewer and the author use the same account (e.g. a reviewer session run by the same person), the login cannot tell them apart: judge from what the comments say, and say that you did.
 
 ### 2. Summarize and propose
 
@@ -73,9 +94,11 @@ Then ask which one to take (AskUserQuestion, with the recommended one first). If
 
 ## Catch up on #N
 
+First, read whether it is open. If it is closed or merged, say so, point to what remains (e.g. follow-up Issues, or a PR that closed it), and stop there instead of making a plan.
+
 ### An Issue
 
-1. **Read the Issue**: the body, all comments, labels, and linked or referencing PRs and Issues. Check whether work on it has already started: a PR that refers to it, or a branch named after it, local or remote (`git branch -a` after `git fetch --prune`), including one checked out in another worktree (`git worktree list`)
+1. **Read the Issue**: the body, all comments, labels, and linked or referencing PRs and Issues. Check whether work on it has already started: a PR that refers to it, or a branch named after it, local or remote (`git branch -a`), including one checked out in another worktree (`git worktree list`)
 2. **Read the project**: the rules, the docs that act as the spec, the structure, and then the code, tests, and docs the Issue touches. Find the impact: the files that would change, the tests to add or update, and the docs that must change with the code
 3. **Find what is open**: unclear or contradictory points in the Issue, and the decisions it leaves open (the Issue may list them)
 4. **Propose a plan**:
@@ -91,8 +114,6 @@ Then ask which one to take (AskUserQuestion, with the recommended one first). If
 1. **Read the PR**: the description, state, base and head, commits, review decisions, review comments and the unresolved review threads (see "Unresolved review threads"), CI checks, merge conflicts, and the Issue it closes
 2. **Read the local state**: whether the head branch exists locally, whether it is checked out, and whether it is in sync with the remote
 3. **Summarize**: what the PR does, where it stands (approved, changes requested, unresolved comments, failing checks, conflicts), what the latest handoff comment says, and the next step (e.g. address the unresolved comments, request a re-review). Merging is the user's decision; do not propose to merge on your own
-
-If the Issue or PR is closed or merged, say so, and point to what remains (e.g. follow-up Issues).
 
 Then stop. Do not start implementing, even if the plan looks obvious. Wait for the user's go-ahead.
 
