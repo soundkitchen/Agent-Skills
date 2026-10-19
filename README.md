@@ -8,7 +8,8 @@ Claude Code 用の自作 skill と mod の集まり。
 |---|---|
 | [you-are-a-reviewer](you-are-a-reviewer/README.md) | セッションをレビュー担当にする。他のセッションから届いたレビュー依頼を code-review でレビューし、結果を返す。[request-review](request-review/README.md) と組で使う |
 | [request-review](request-review/README.md) | you-are-a-reviewer のセッションに、今のブランチの PR のレビューを依頼する。LGTM が出るまで修正と再依頼を繰り返すこともできる |
-| [wrap-up](wrap-up/README.md) | セッションを閉じる前に、やり残しを片付ける。機械的なものはその場で片付け、残りの作業は Issue・PR のコメント・docs などに引き継ぐ |
+| [wrap-up](wrap-up/README.md) | セッションを閉じる前に、やり残しを片付ける。機械的なものはその場で片付け、残りの作業は Issue・PR のコメント・docs などに引き継ぐ。[catch-up](catch-up/README.md) と組で使う |
+| [catch-up](catch-up/README.md) | セッションを始めるときに、引き継ぎと開いている Issue・PR を読んで現状をまとめ、次のタスクを提案する。Issue か PR の番号を渡すと、その計画を提案して実装の前で止まる。[wrap-up](wrap-up/README.md) と組で使う |
 
 ## mod 一覧
 
