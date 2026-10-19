@@ -84,7 +84,7 @@ Then ask which one to take (AskUserQuestion, with the recommended one first). If
    - **Impact**: the files, tests, and docs that would change
    - **Plan**: the steps, in units that can each be committed
    - **Branch**: a name that follows the project's naming rule. Do not create it; it is created once the plan is approved
-   - **Decisions**: the direction-level decisions the user should make (ask them with AskUserQuestion), and the details you will decide yourself (list them so that the user can object)
+   - **Decisions**: the direction-level decisions the user should make (ask them with AskUserQuestion), and the details you will decide yourself (list them so that the user can object). Give each decision a short name (e.g. **Name of the mod**, **How to notify**), not a number
 
 ### A PR
 
@@ -99,7 +99,7 @@ Then stop. Do not start implementing, even if the plan looks obvious. Wait for t
 ## Writing the summary
 
 - Lead with the conclusion (what to do next), then the details
-- Use headings and short labeled bullets. Name things instead of numbering them, so that the user does not have to match numbers to items (e.g. refer to a candidate by a short name, not "option 2")
+- Use headings and short labeled bullets. Name things instead of numbering them, so that the user does not have to match numbers to items. This applies to candidates, decisions, and options alike: refer to them by a short name (e.g. **Name of the mod**), never as "option 2" or "the 4 points". Number only steps whose order matters
 - Reference code as `file:line`, and Issues and PRs as `#N`
 - Keep what you read apart from what you infer, and say what you could not check
 
