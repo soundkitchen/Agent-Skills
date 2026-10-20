@@ -65,14 +65,14 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
 3. **Run code-review** (first review of a PR only; for a re-review, see "Re-reviews" below): Invoke the `code-review` skill via the Skill tool with arguments `<options> <target>`
    - Example: started as `/you-are-a-reviewer medium --comment` and asked to "review PR #12" → `medium --comment 12`
    - This working tree may be on another branch, so its files may not match the PR. Before running code-review on a PR, fetch the PR's head commit into a dedicated ref: `git fetch <remote> +pull/<n>/head:refs/pr/<n>`, where `<remote>` is the git remote that points to the PR's repository (check `git remote -v`; in a fork setup this is usually `upstream`). If no remote points to it, ask the user. The `+` overwrites the ref on re-review; this does not touch the working tree. During the review, read any file contents needed for context from that ref (`git show refs/pr/<n>:<path>`), not from this working tree. Do not store it under `refs/remotes/`: git treats that as a remote-tracking branch, so `fetch --prune` from any worktree could delete it
-4. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
+4. **Post the result to the PR**, if `--comment` is in effect (see "Posting to the PR"). Post it before replying, so that the reply can say whether it was posted
+5. **Send the results back**: Call SendMessage with `to` set to the exact value of the request's `from` attribute. The message must include:
    - First line: a self-contained summary such as "Review of PR #12: N findings" (in the specified language, like the rest of the message)
    - The exact code-review arguments actually used, and the PR head commit that was reviewed
    - The full findings, most severe first (file:line, what is wrong, how it breaks)
-   - If there are no findings, say so
-   - If findings were posted to the PR via `--comment`, say so
+   - If there are no findings, say LGTM clearly
+   - Whether anything was posted to the PR: findings posted by code-review via `--comment`, and the result comment in step 4 (or that posting it failed)
    - If `--fix` was requested, say that it was dropped and why
-5. **Post the result to the PR**, if `--comment` is in effect and code-review posted nothing (e.g. there were no findings), so that the PR shows the result (see "Posting to the PR")
 6. Briefly report the result to the user as well, then wait for the next request
 
 ## Re-reviews
@@ -87,15 +87,15 @@ A request is a re-review when this session has already reviewed the same PR and 
    - If the requester says a point was decided not to be fixed and gives a reason (e.g. the user's decision), judge the reason. If you accept it, close the point as "not fixed (agreed)"; it does not block LGTM. If you do not accept it, keep it open and explain why
 4. Also check the changes made to address those points. If a change introduced a new problem, report it as part of the corresponding point. Do not report anything else about the code that was already reviewed
 5. If the changes since the commit you last reviewed include changes unrelated to addressing the open points (e.g. a new feature added after an LGTM), review those changes with code-review: run it on the PR as in step 3 above, and keep only the findings located in those changes. If `--comment` is in effect, code-review may post findings outside those changes too, so say so in the reply
-6. Send the result back with SendMessage as in step 4 above. The message must include:
+6. **Post the result to the PR**, if `--comment` is in effect (see "Posting to the PR"). Post it on every re-review, not only on LGTM, so that the PR shows where the review stands. Post it before replying, so that the reply can say whether it was posted
+7. Send the result back with SendMessage as in step 5 of "When a review request arrives". The message must include:
    - First line: a self-contained summary such as "Re-review of PR #12: M of N previous findings resolved" (in the specified language, like the rest of the message)
    - The PR head commit that was checked
    - The status of each open point, with the reason
    - Any problems introduced by the fixes
    - If unrelated changes were reviewed in step 5: the code-review arguments used, and the findings in those changes
    - If every open point is resolved or closed as "not fixed (agreed)", no fix introduced a problem, and there are no findings in unrelated changes, say LGTM clearly
-   - Whether anything was posted to the PR: by code-review in step 5, and the result comment in step 7
-7. **Post the result to the PR**, if `--comment` is in effect (see "Posting to the PR"). Post it on every re-review, not only on LGTM, so that the PR shows where the review stands
+   - Whether anything was posted to the PR: by code-review in step 5, and the result comment in step 6 (or that posting it failed)
 8. Briefly report the result to the user as well, then wait for the next request
 
 ## Posting to the PR
@@ -105,16 +105,18 @@ Post to the PR only when `--comment` is in effect for the review (from the defau
 With `--comment`, two things are posted:
 
 - **code-review's own posts**: the findings as inline comments (and a summary, if code-review posts one). Leave these entirely to code-review
-- **The result comment**, posted by this session, so that the PR shows the result even when code-review posts nothing (a first review with no findings, and every re-review). Requesters and the next sessions read it to know where the review stands. The reviewer and the PR author often use the same GitHub account, so a GitHub approval is not possible; this comment takes its place
+- **The result comment**, posted by this session after every review (the first review and every re-review, with or without findings), so that the PR shows which commit was reviewed and whether it is LGTM, even when code-review posts nothing. Requesters and the next sessions read it to know where the review stands. The reviewer and the PR author often use the same GitHub account, so a GitHub approval is not possible; this comment takes its place
 
 Post the result comment with `gh pr comment <n> --repo <owner>/<repo> --body-file -` (the PR's repository, as in step 1 of "When a review request arrives"). Write it in the specified language, shorter than the reply:
 
-- First line: that it comes from the reviewer session, and the summary (e.g. LGTM, or how many of the previous findings were resolved), so that it can be told apart from the author's comments on the same account
+- First line: exactly `<!-- you-are-a-reviewer:result -->`. This marker does not show on GitHub, and it does not depend on the language. Readers such as catch-up find result comments by it, since the reviewer and the author often use the same account and the author's comments may also mention LGTM
+- Next line: that it comes from the reviewer session, and the summary (e.g. LGTM, the number of findings, or how many of the previous findings were resolved)
 - The PR head commit that was reviewed. Put the full SHA so that a reader can tell whether commits were pushed after it
+- For a first review with findings: that the findings are in code-review's comments, and that it is not LGTM
 - For a re-review: the status of each open point, one line each (resolved, partially resolved, not resolved, not fixed (agreed)), and any problems introduced by the fixes
 - Whether it is LGTM. Say LGTM only when the reply says LGTM
 
-Do not post anything else: no other comments, no approval or request for changes, and do not resolve review threads (matching findings to threads is error-prone, and the result comment already shows which points are resolved). If posting fails, say so in the reply and to the user; the reply via SendMessage still stands.
+Do not post anything else: no other comments, no approval or request for changes, and do not resolve review threads (matching findings to threads is error-prone, and the result comment already shows which points are resolved). Post the result comment before the reply. If posting fails, say so in the reply and to the user; the reply via SendMessage still stands.
 
 ## Messages that are not review requests
 
