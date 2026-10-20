@@ -52,7 +52,7 @@ gh api graphql -F owner=<owner> -F name=<repo> -f query='
       pullRequests(states: OPEN, first: 100, orderBy: {field: UPDATED_AT, direction: DESC}) {
         pageInfo { hasNextPage }
         nodes {
-          number title updatedAt author { login } reviewDecision mergeable
+          number title updatedAt headRefOid author { login } reviewDecision mergeable
           commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
           comments(last: 3) { nodes { author { login } body createdAt } }
           reviewThreads(first: 100) {
@@ -84,6 +84,12 @@ gh api graphql --paginate -F owner=<owner> -F name=<repo> -F number=<N> -f query
 
 A thread that is not resolved but whose last comment is from the PR author may already be addressed: say so instead of calling it unanswered. If the reviewer and the author use the same account (e.g. a reviewer session run by the same person), the login cannot tell them apart: judge from what the comments say, and say that you did.
 
+**Review result comments**: a reviewer session may post its result as a PR comment (e.g. you-are-a-reviewer with `--comment` posts LGTM, or how many of the previous findings were resolved, with the full SHA of the head commit it reviewed). Take the latest such comment as where the review stands, ahead of what the threads suggest:
+
+- LGTM for the PR's current head commit (`headRefOid`): the review has passed, and the PR is waiting for the user's decision to merge
+- LGTM for an older commit: say which commits were pushed after it; they have not been reviewed
+- Not LGTM: the points it says are still open are the next thing to address
+
 ### 2. Summarize and propose
 
 - **Where things stand**: what was done recently, what is in progress (open PRs, branches, leftovers in the working tree), and what is waiting on someone (e.g. a PR waiting for review, an Issue waiting for a decision)
@@ -113,9 +119,9 @@ First, read whether it is open. If it is closed or merged, say so, point to what
 
 ### A PR
 
-1. **Read the PR**: the description, state, base and head, commits, review decisions, review comments and the unresolved review threads (see "Unresolved review threads"), CI checks, merge conflicts, and the Issue it closes
+1. **Read the PR**: the description, state, base and head, commits, review decisions, review comments and the unresolved review threads (see "Unresolved review threads"), the latest review result comment (see "Review result comments"), CI checks, merge conflicts, and the Issue it closes
 2. **Read the local state**: whether the head branch exists locally, whether it is checked out, and whether it is in sync with the remote
-3. **Summarize**: what the PR does, where it stands (approved, changes requested, unresolved comments, failing checks, conflicts), what the latest handoff comment says, and the next step (e.g. address the unresolved comments, request a re-review). Merging is the user's decision; do not propose to merge on your own
+3. **Summarize**: what the PR does, where it stands (approved, LGTM from a reviewer session and for which commit, changes requested, unresolved comments, failing checks, conflicts), what the latest handoff comment says, and the next step (e.g. address the unresolved comments, request a re-review). Merging is the user's decision; do not propose to merge on your own
 
 Then stop. Do not start implementing, even if the plan looks obvious. Wait for the user's go-ahead.
 
