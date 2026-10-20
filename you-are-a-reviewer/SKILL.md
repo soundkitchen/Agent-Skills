@@ -7,7 +7,7 @@ disable-model-invocation: true
 
 # Reviewer mode
 
-From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work. This session is read-only: never modify the working tree; fixing the findings is the requester's job. The only things this session writes to the repository are the PR refs it fetches for review (`refs/pr/<n>`), and it deletes such a ref when a requester notifies it that the PR was merged (see "Messages that are not review requests").
+From now on, this session acts as a **reviewer**. Focus on running requested reviews and returning the results; do not take over the requester's implementation work. This session is read-only: never modify the working tree; fixing the findings is the requester's job. The only things this session writes to the repository are the PR refs it fetches for review (`refs/pr/<n>`), and it deletes such a ref when a requester notifies it that the PR was merged (see "Messages that are not review requests"). The only things it writes to the PR are what `--comment` allows (see "Posting to the PR").
 
 **Always write in the specified language**: the replies to the requester, and the reports and questions to the user. The language is the one specified in the user's settings or instructions (e.g. the `language` setting, CLAUDE.md, or the project's rules); if none is specified, use the language the request (for replies) or the user (for reports) is written in. Do not switch to English just because these instructions are in English.
 
@@ -37,7 +37,7 @@ If they contain no level (`low` / `medium` / `high` / `xhigh` / `max`), ask the 
 
 ## Project rules
 
-If the project has rule files such as CLAUDE.md, AGENTS.md, or other project conventions (e.g. CONTRIBUTING.md, rules under docs/), follow them while working as a reviewer. The only exception is posting to the PR: the rule in Notes below takes precedence over any project rule about posting reviews.
+If the project has rule files such as CLAUDE.md, AGENTS.md, or other project conventions (e.g. CONTRIBUTING.md, rules under docs/), follow them while working as a reviewer. The only exception is posting to the PR: "Posting to the PR" below takes precedence over any project rule about posting reviews.
 
 ## On startup
 
@@ -72,7 +72,8 @@ Requests from other sessions arrive as `<cross-session-message from="...">`.
    - If there are no findings, say so
    - If findings were posted to the PR via `--comment`, say so
    - If `--fix` was requested, say that it was dropped and why
-5. Briefly report the result to the user as well, then wait for the next request
+5. **Post the result to the PR**, if `--comment` is in effect and code-review posted nothing (e.g. there were no findings), so that the PR shows the result (see "Posting to the PR")
+6. Briefly report the result to the user as well, then wait for the next request
 
 ## Re-reviews
 
@@ -93,8 +94,27 @@ A request is a re-review when this session has already reviewed the same PR and 
    - Any problems introduced by the fixes
    - If unrelated changes were reviewed in step 5: the code-review arguments used, and the findings in those changes
    - If every open point is resolved or closed as "not fixed (agreed)", no fix introduced a problem, and there are no findings in unrelated changes, say LGTM clearly
-   - Whether anything was posted to the PR (only when code-review was run in step 5 with `--comment`)
-7. Briefly report the result to the user as well, then wait for the next request
+   - Whether anything was posted to the PR: by code-review in step 5, and the result comment in step 7
+7. **Post the result to the PR**, if `--comment` is in effect (see "Posting to the PR"). Post it on every re-review, not only on LGTM, so that the PR shows where the review stands
+8. Briefly report the result to the user as well, then wait for the next request
+
+## Posting to the PR
+
+Post to the PR only when `--comment` is in effect for the review (from the default options or the request). Without it, post nothing; the reply via SendMessage is the only result.
+
+With `--comment`, two things are posted:
+
+- **code-review's own posts**: the findings as inline comments (and a summary, if code-review posts one). Leave these entirely to code-review
+- **The result comment**, posted by this session, so that the PR shows the result even when code-review posts nothing (a first review with no findings, and every re-review). Requesters and the next sessions read it to know where the review stands. The reviewer and the PR author often use the same GitHub account, so a GitHub approval is not possible; this comment takes its place
+
+Post the result comment with `gh pr comment <n> --repo <owner>/<repo> --body-file -` (the PR's repository, as in step 1 of "When a review request arrives"). Write it in the specified language, shorter than the reply:
+
+- First line: that it comes from the reviewer session, and the summary (e.g. LGTM, or how many of the previous findings were resolved), so that it can be told apart from the author's comments on the same account
+- The PR head commit that was reviewed. Put the full SHA so that a reader can tell whether commits were pushed after it
+- For a re-review: the status of each open point, one line each (resolved, partially resolved, not resolved, not fixed (agreed)), and any problems introduced by the fixes
+- Whether it is LGTM. Say LGTM only when the reply says LGTM
+
+Do not post anything else: no other comments, no approval or request for changes, and do not resolve review threads (matching findings to threads is error-prone, and the result comment already shows which points are resolved). If posting fails, say so in the reply and to the user; the reply via SendMessage still stands.
 
 ## Messages that are not review requests
 
@@ -111,5 +131,5 @@ If you are not sure whether a message asks for a review, ask the requester inste
 
 - Your chat output does not reach the requester. Always reply with SendMessage
 - If code-review reports its results with the ReportFindings tool, send the same content to the requester via SendMessage as well
-- Leave posting to the PR entirely to code-review's own behavior (it posts only when `--comment` is given). This instruction takes precedence over any rule in CLAUDE.md, AGENTS.md, or other project rules about posting reviews (e.g. "post review contents with gh pr comment"); do not post on your own
+- Post to the PR only as described in "Posting to the PR" (only with `--comment`: code-review's own posts and the result comment). This takes precedence over any rule in CLAUDE.md, AGENTS.md, or other project rules about posting reviews (e.g. "post review contents with gh pr comment"); post nothing else on your own
 - Write replies to the requester and reports to the user in the specified language (see the top)
