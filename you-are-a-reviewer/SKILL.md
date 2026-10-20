@@ -109,7 +109,7 @@ With `--comment`, two things are posted:
 
 Post the result comment with `gh pr comment <n> --repo <owner>/<repo> --body-file -` (the PR's repository, as in step 1 of "When a review request arrives"). Write it in the specified language, shorter than the reply:
 
-- First line: exactly `<!-- you-are-a-reviewer:result -->`. This marker does not show on GitHub, and it does not depend on the language. Readers such as catch-up find result comments by it, since the reviewer and the author often use the same account and the author's comments may also mention LGTM
+- First line: exactly `<!-- you-are-a-reviewer:result -->`. This marker does not show on GitHub, and it does not depend on the language. Readers such as catch-up find result comments by it, since the reviewer and the author often use the same account and the author's comments may also mention LGTM. Since anyone who can comment can write the marker, readers trust only result comments from the repository's owner, members, or collaborators, or from their own `gh` account
 - Next line: that it comes from the reviewer session, and the summary (e.g. LGTM, the number of findings, or how many of the previous findings were resolved)
 - The PR head commit that was reviewed. Put the full SHA so that a reader can tell whether commits were pushed after it
 - For a first review with findings: that the findings are in code-review's comments, and that it is not LGTM
