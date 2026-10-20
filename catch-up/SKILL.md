@@ -43,7 +43,7 @@ This skill only reads and proposes. Do not commit, push, create or switch branch
 
 `gh issue list` and `gh pr list` return only 30 items by default, newest created first: pass a `--limit` large enough for all open ones (e.g. `--limit 500`) and `--json number,title,labels,updatedAt`, and sort by `updatedAt` yourself. If the result reaches the limit, say that the list may be cut. If there are many open Issues (more than about 20), read the titles of all and the details of the 10 most recently updated, and say that you did; the same for PRs, counted separately.
 
-**Open PRs in one query**: this gets the open PRs, most recently updated first, with their review state, CI state, latest conversation comments (where handoffs are left), and review threads. For each thread, the last comment is enough here; if a PR has more threads than one page (`reviewThreads.pageInfo.hasNextPage`), get the rest as in "Unresolved review threads". If there are more open PRs than one page (`pullRequests.pageInfo.hasNextPage`), say that the list may be cut; read a PR's older comments with `gh pr view <N> --comments` when the latest ones point to them.
+**Open PRs in one query**: this gets the open PRs, most recently updated first, with their review state, CI state, latest conversation comments (where handoffs are left), and review threads. For each thread, the last comment is enough here; if a PR has more threads than one page (`reviewThreads.pageInfo.hasNextPage`), get the rest as in "Unresolved review threads". If there are more open PRs than one page (`pullRequests.pageInfo.hasNextPage`), say that the list may be cut; read a PR's older comments with `gh pr view <N> --comments` when the latest ones point to them. If a PR has more comments than were fetched (`comments.totalCount`) and none of the fetched ones is a review result comment, look for the latest one as in "Review result comments".
 
 ```sh
 gh api graphql -F owner=<owner> -F name=<repo> -f query='
@@ -54,7 +54,7 @@ gh api graphql -F owner=<owner> -F name=<repo> -f query='
         nodes {
           number title updatedAt headRefOid author { login } reviewDecision mergeable
           commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
-          comments(last: 3) { nodes { author { login } body createdAt } }
+          comments(last: 3) { totalCount nodes { author { login } body createdAt } }
           reviewThreads(first: 100) {
             pageInfo { hasNextPage }
             nodes { isResolved isOutdated path comments(last: 1) { nodes { author { login } } } }
@@ -84,11 +84,21 @@ gh api graphql --paginate -F owner=<owner> -F name=<repo> -F number=<N> -f query
 
 A thread that is not resolved but whose last comment is from the PR author may already be addressed: say so instead of calling it unanswered. If the reviewer and the author use the same account (e.g. a reviewer session run by the same person), the login cannot tell them apart: judge from what the comments say, and say that you did.
 
-**Review result comments**: a reviewer session may post its result as a PR comment (e.g. you-are-a-reviewer with `--comment` posts LGTM, or how many of the previous findings were resolved, with the full SHA of the head commit it reviewed). Take the latest such comment as where the review stands, ahead of what the threads suggest:
+**Review result comments**: a reviewer session may post its result as a PR comment after every review: you-are-a-reviewer with `--comment` posts whether it is LGTM, the number of findings or how many of the previous findings were resolved, and the full SHA of the head commit it reviewed. Such a comment starts with the line `<!-- you-are-a-reviewer:result -->`; count only comments with this marker, not comments that merely mention LGTM (the author may use the same account). To find the latest one among all the comments of a PR, take the last line printed by:
 
-- LGTM for the PR's current head commit (`headRefOid`): the review has passed, and the PR is waiting for the user's decision to merge
-- LGTM for an older commit: say which commits were pushed after it; they have not been reviewed
+```sh
+gh api repos/<owner>/<repo>/issues/<N>/comments --paginate \
+  --jq '.[] | select(.body | startswith("<!-- you-are-a-reviewer:result -->")) | {created_at, body}'
+```
+
+Read the latest one as where that reviewer session's review stands:
+
+- LGTM: the review by that session has passed
 - Not LGTM: the points it says are still open are the next thing to address
+
+Then compare its SHA with the PR's current head commit (`headRefOid`), whether it is LGTM or not. If they match, the result is for the current head: with LGTM and nothing else open, the PR is waiting for the user's decision to merge. If they differ, say which commits were pushed after it: they have not been reviewed, so the next step may be to request a (re-)review rather than to fix the open points again.
+
+The comment covers only that reviewer session's review. Report it together with the rest of the review state, not instead of it: a human reviewer's `reviewDecision` (e.g. `CHANGES_REQUESTED`), and review threads opened or left unresolved by others, still stand.
 
 ### 2. Summarize and propose
 
