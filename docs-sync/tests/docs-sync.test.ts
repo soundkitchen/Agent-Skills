@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { joinDir, parseJson, parsePrCreate, parsePush, repoOf, splitCommand } from '../hooks/register.ts'
+import { ghRepoFlag, hostOf, joinDir, parseJson, parsePrCreate, parsePush, repoOf, splitCommand } from '../hooks/register.ts'
 
 // 区切りごとの単語だけを取り出す(置換の中は含めない)
 const wordsOf = (command: string) => splitCommand(command).map(s => s.words)
@@ -16,6 +16,15 @@ type Pr = { number: number; state: string; baseRefName: string; headRefName: str
 // fork の構成。origin が自分の fork(me/r)、upstream が元のリポジトリ(o/r)
 const FORK_REMOTES = { origin: 'git@github.com:me/r.git', upstream: 'https://github.com/o/r.git' }
 const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName: 'fix/foo' }
+// git と gh は、設定からプログラムを起動しうるもの(fsmonitor・外部 diff・textconv)を止めて実行する。
+// fsmonitor は GIT_CONFIG_* の環境変数で、外部 diff・textconv は diff・show の引数で止める
+const SUBCOMMAND_OFF: Record<string, string[]> = { diff: ['--no-ext-diff', '--no-textconv'], show: ['--no-textconv'] }
+// GIT_CONFIG_* の環境変数で上書きした設定の値
+function configOf(env: Record<string, string> | undefined, key: string): string | undefined {
+  const count = Number(env?.['GIT_CONFIG_COUNT'] ?? 0)
+  for (let i = 0; i < count; i++) if (env?.[`GIT_CONFIG_KEY_${i}`] === key) return env[`GIT_CONFIG_VALUE_${i}`]
+  return undefined
+}
 
 // git・gh と model を差し替え、Bash の実行は「走った」ことだけを記録する。
 // 今のブランチは fix/foo(upstream は origin/fix/foo)。remote は、remotes を省略すると origin(o/r)と fork(me/r)。
@@ -24,10 +33,16 @@ const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName
 // unfetched なら upstream/main はまだ fetch していない。partial は partial clone の remote の名前
 // files はファイルごとの差分(差分全体はそれをつなげたもの)。binary はバイナリ、generated は linguist-generated のファイル。
 // truncated なら、差分全体の出力が 4 MiB を超えて切れる。unreadable はファイルごとの差分を取れないファイル
+// remoteHeads は <remote>/HEAD が指すブランチ(省略すると origin だけ main)、refs はほかに解決できる ref とそのコミット
+// git は SUBCOMMAND_OFF を外して calls.git に記録する(GIT_NO_LAZY_FETCH 付きなら calls.noLazy にも)。
+// fsmonitor・外部 diff・textconv を止めていない git と gh は失敗させ、calls.unsafe に記録する。
+// root は Claude Code を起動した場所(省略すると cwd と同じ)。cwd は、それまでの cd で動いたセッションの cwd
+// calls.cwds は、起動した場所以外で git rev-parse --show-toplevel を実行した場所
 function world(
   on: On,
   opts: {
     cwd?: string
+    root?: string
     diff?: string
     docs?: Record<string, string>
     prs?: Pr[]
@@ -41,22 +56,31 @@ function world(
     generated?: string[]
     truncated?: boolean
     unreadable?: string[]
+    remoteHeads?: Record<string, string>
+    refs?: Record<string, string>
     model: Model
   },
 ) {
   const remotes = opts.remotes ?? { origin: 'git@github.com:o/r.git', fork: 'https://github.com/me/r.git' }
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
-  const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[] }
+  const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[], unsafe: [] as string[], noLazy: [] as string[] }
+  const remoteHeads = opts.remoteHeads ?? { origin: 'main' }
 
   mock.store(on)
   on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
+  on('session.root', async () => ({ value: opts.root ?? opts.cwd ?? ROOT }))
   on('session.model', async () => ({ value: SESSION_MODEL }))
 
   on('process.run', async ($, e) => {
     const [cmd, ...args] = e.argv
     const ok = (stdout: string) => ({ value: { exitCode: 0, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } })
     const fail = { value: { exitCode: 1, stdout: '', stderr: 'no', isStdoutTruncated: false, isStderrTruncated: false } }
+    const hardened = configOf(e.init?.env, 'core.fsmonitor') === 'false'
     if (cmd === 'gh') {
+      if (!hardened) {
+        calls.unsafe.push(e.argv.join(' '))
+        return fail
+      }
       calls.gh.push(args.join(' '))
       if (args[0] === 'repo' && args[1] === 'view') {
         if (opts.ghRepoFails === true) return fail
@@ -75,10 +99,17 @@ function world(
       return ok(JSON.stringify(open))
     }
     if (cmd !== 'git') return fail
-    const sub = args.join(' ')
+    const off = SUBCOMMAND_OFF[args[0]!] ?? []
+    if (!hardened || off.some(a => !args.includes(a))) {
+      calls.unsafe.push(e.argv.join(' '))
+      return fail
+    }
+    const plain = args.filter(a => !off.includes(a))
+    const sub = plain.join(' ')
     calls.git.push(sub)
+    if (e.init?.env?.['GIT_NO_LAZY_FETCH'] === '1') calls.noLazy.push(sub)
     if (sub === 'rev-parse --show-toplevel') {
-      calls.cwds.push(e.init?.cwd ?? '')
+      if (e.init?.cwd !== (opts.root ?? opts.cwd ?? ROOT)) calls.cwds.push(e.init?.cwd ?? '')
       // 展開されていない変数を含む場所は、リポジトリとして見つからない
       if (e.init?.cwd?.includes('$') === true) return fail
       return ok(`${e.init?.cwd?.endsWith('/other') ? '/other' : ROOT}\n`)
@@ -95,12 +126,18 @@ function world(
     if (url !== null) return url[1]! in remotes ? ok(`${remotes[url[1]!]}\n`) : fail
     if (sub === 'rev-parse --verify --quiet HEAD^{commit}') return ok(`${HEAD}\n`)
     if (sub === 'rev-parse --verify --quiet fix/foo^{commit}') return ok(`${HEAD}\n`)
-    if (sub === 'symbolic-ref --short refs/remotes/origin/HEAD' && 'origin' in remotes) return ok('origin/main\n')
+    const remoteHead = /^symbolic-ref --short refs\/remotes\/(\S+)\/HEAD$/.exec(sub)
+    if (remoteHead !== null) {
+      const r = remoteHead[1]!
+      return r in remotes && r in remoteHeads ? ok(`${r}/${remoteHeads[r]}\n`) : fail
+    }
     if (sub === 'rev-parse --verify --quiet origin/main^{commit}') return ok('deadbeef\n')
     if (sub === 'rev-parse --verify --quiet upstream/main^{commit}' && 'upstream' in remotes && opts.unfetched !== true) return ok('cafe00\n')
     if (sub === 'rev-parse --verify --quiet origin/feature/x^{commit}') return ok(`${FEATURE_HEAD}\n`)
+    const ref = /^rev-parse --verify --quiet (\S+)\^\{commit\}$/.exec(sub)
+    if (ref !== null && opts.refs?.[ref[1]!] !== undefined) return ok(`${opts.refs[ref[1]!]}\n`)
     if (sub.startsWith('rev-parse --verify --quiet')) return fail
-    if (/^diff --no-color (origin|upstream)\/main\.\.\.\w+$/.test(sub)) {
+    if (/^diff --no-color \S+\.\.\.\w+$/.test(sub)) {
       if (opts.truncated === true) return { value: { ...ok('+ cut').value, isStdoutTruncated: true } }
       return ok(opts.diff ?? (opts.files !== undefined ? Object.values(opts.files).join('') : '+ renamed --fast to --quick\n'))
     }
@@ -109,15 +146,15 @@ function world(
     }
     const one = /^diff --no-color --no-renames \S+ -- :\(literal\)(.+)$/.exec(sub)
     if (one !== null) return opts.unreadable?.includes(one[1]!) === true ? fail : ok(opts.files?.[one[1]!] ?? '')
-    if (args[0] === 'check-attr') {
+    if (plain[0] === 'check-attr') {
       const paths = (e.init?.stdin ?? '').split('\0').filter(f => f !== '')
       const generated = (f: string) => (opts.generated?.includes(f) === true ? 'set' : 'unspecified')
       return ok(paths.flatMap(f => [f, 'linguist-generated', generated(f), f, 'linguist-vendored', 'unspecified']).join('\0') + '\0')
     }
-    if (/^diff --name-only (origin|upstream)\/main\.\.\.\w+$/.test(sub)) return ok('src/cli.ts\n')
+    if (/^diff --name-only \S+\.\.\.\w+$/.test(sub)) return ok('src/cli.ts\n')
     if (sub.startsWith('ls-tree -r --name-only')) return ok([...Object.keys(docs), 'src/cli.ts'].join('\n') + '\n')
-    if (args[0] === 'show') {
-      const path = args[1]!.replace(/^\w+:/, '')
+    if (plain[0] === 'show') {
+      const path = plain[1]!.replace(/^\w+:/, '')
       return path in docs ? ok(docs[path]!) : fail
     }
     return fail
@@ -281,6 +318,65 @@ describe('docs-sync', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr create -R me/r --fill' })
     expect(calls.gh).toEqual(['repo view me/r --json nameWithOwner,defaultBranchRef'])
     expect(calls.git).toContain(`diff --no-color origin/main...${HEAD}`)
+  })
+
+  test('passes -R that points to github.com to gh repo view as github.com/OWNER/REPO', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, model: OK })
+    for (const repo of ['https://github.com/o/r/', 'http://github.com/o/r', 'git@github.com:o/r.git', 'ssh://git@github.com/o/r']) {
+      await $.tool.call({ tool: 'Bash', command: `gh pr create -R ${repo} --fill` })
+    }
+    expect(calls.gh).toEqual(Array(4).fill('repo view github.com/o/r --json nameWithOwner,defaultBranchRef'))
+  })
+
+  test('does not pass -R with another host to gh, and uses the remote on that host and its default branch', async ($, on) => {
+    const remotes = { ...FORK_REMOTES, ghe: 'git@ghe.example:o/r.git' }
+    const calls = world(on, { remotes, remoteHeads: { origin: 'main', ghe: 'develop' }, refs: { 'ghe/develop': 'beef01' }, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create -R ghe.example/o/r --fill' })
+    expect(calls.gh).toEqual([])
+    expect(calls.ran).toEqual(['gh pr create -R ghe.example/o/r --fill'])
+    expect(calls.git).toContain(`diff --no-color ghe/develop...${HEAD}`)
+  })
+
+  test('uses --base with -R on another host, without reading the default branch of the remote', async ($, on) => {
+    const remotes = { ...FORK_REMOTES, ghe: 'https://ghe.example/o/r.git' }
+    const calls = world(on, { remotes, refs: { 'ghe/release': 'beef02' }, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create -R https://ghe.example/o/r --base release --fill' })
+    expect(calls.gh).toEqual([])
+    expect(calls.git).toContain(`diff --no-color ghe/release...${HEAD}`)
+  })
+
+  test('does not match -R on another host with a remote on github.com that has the same owner/name', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create -R other.example/o/r --fill' })
+    expect(calls.ran).toEqual([])
+    expect(calls.gh).toEqual([])
+    expect(calls.git.some(c => c.startsWith('diff '))).toBe(false)
+    expect(r.deny).toContain('no remote points to the repository given with -R (other.example/o/r)')
+  })
+
+  test('does not guess the base when the remote for -R on another host has no default branch', async ($, on) => {
+    const remotes = { ...FORK_REMOTES, ghe: 'git@ghe.example:o/r.git' }
+    const calls = world(on, { remotes, model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create -R ghe.example/o/r --fill' })
+    expect(calls.ran).toEqual([])
+    expect(calls.git.some(c => c.startsWith('diff '))).toBe(false)
+    expect(r.deny).toContain('ghe/HEAD is not set')
+    expect(r.deny).toContain('git remote set-head ghe --auto')
+  })
+
+  test('fetches missing objects of a partial clone only in the repository of the session', async ($, on) => {
+    const calls = world(on, { model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.noLazy.filter(c => c.startsWith('diff ') || c.startsWith('show '))).toEqual([])
+    await $.tool.call({ tool: 'Bash', command: 'cd ../other && gh pr create --fill' })
+    expect(calls.noLazy).toContain(`diff --no-color origin/main...${HEAD}`)
+    expect(calls.noLazy).toContain(`show ${HEAD}:README.md`)
+  })
+
+  test('does not trust a repository that an earlier cd moved the session cwd to', async ($, on) => {
+    const calls = world(on, { root: ROOT, cwd: `${ROOT}/../other`, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.noLazy).toContain(`diff --no-color origin/main...${HEAD}`)
   })
 
   test('falls back to origin when gh repo view fails', async ($, on) => {
@@ -463,6 +559,16 @@ describe('docs-sync on a large diff', () => {
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual(['gh pr create --fill'])
     expect(r.context?.[0]).toContain('found no mismatch')
+  })
+
+  test('runs every git and gh command with fsmonitor, external diff and textconv turned off', async ($, on) => {
+    const calls = world(on, { files: { 'src/cli.ts': '+ renamed --fast to --quick\n' }, truncated: true, model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(r.context?.[0]).toContain('found no mismatch')
+    expect(calls.unsafe).toEqual([])
+    expect(calls.git).toContain(`diff --no-color --no-renames origin/main...${HEAD} -- :(literal)src/cli.ts`)
+    expect(calls.git).toContain(`show ${HEAD}:README.md`)
+    expect(calls.gh).toEqual(['repo view --json nameWithOwner,defaultBranchRef'])
   })
 
   test('asks the user about the files it could not check, and remembers the choice for the commit', async ($, on) => {
@@ -819,6 +925,40 @@ describe('repoOf', () => {
     expect(repoOf('https://github.com/owner/repo')).toBe('owner/repo')
     expect(repoOf('ssh://git@github.com/owner/repo.git/')).toBe('owner/repo')
     expect(repoOf('repo')).toBe(undefined)
+  })
+})
+
+describe('hostOf', () => {
+  test('reads the host from URLs, the SSH form and HOST/OWNER/REPO', async () => {
+    expect(hostOf('https://GitHub.com/o/r/')).toBe('github.com')
+    expect(hostOf('ssh://git@ghe.example:2222/o/r.git')).toBe('ghe.example')
+    expect(hostOf('git@ghe.example:o/r.git')).toBe('ghe.example')
+    expect(hostOf('ghe.example/o/r')).toBe('ghe.example')
+    expect(hostOf('https://github.com@evil.example/o/r')).toBe('evil.example')
+  })
+
+  test('returns undefined for OWNER/REPO, local paths and other shapes', async () => {
+    expect(hostOf('o/r')).toBe(undefined)
+    expect(hostOf('/srv/git/o/r.git')).toBe(undefined)
+    expect(hostOf('file:///srv/git/o/r.git')).toBe(undefined)
+    expect(hostOf('https://evil.example/github.com/o/r')).toBe(undefined)
+  })
+})
+
+describe('ghRepoFlag', () => {
+  test('passes OWNER/REPO as is, and turns github.com forms into github.com/OWNER/REPO', async () => {
+    expect(ghRepoFlag('o/r')).toBe('o/r')
+    expect(ghRepoFlag('github.com/o/r')).toBe('github.com/o/r')
+    expect(ghRepoFlag('https://github.com/O/R.git')).toBe('github.com/o/r')
+    expect(ghRepoFlag('git@github.com:o/r.git')).toBe('github.com/o/r')
+  })
+
+  test('does not pass other hosts or values that are not repositories', async () => {
+    expect(ghRepoFlag('ghe.example/o/r')).toBe(undefined)
+    expect(ghRepoFlag('https://github.com@evil.example/o/r')).toBe(undefined)
+    expect(ghRepoFlag('https://evil.example/github.com/o/r')).toBe(undefined)
+    expect(ghRepoFlag('--web')).toBe(undefined)
+    expect(ghRepoFlag('-o/r')).toBe(undefined)
   })
 })
 

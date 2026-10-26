@@ -59,6 +59,9 @@ const DISABLE: Hint = () => 'To turn docs-sync off for a while, the user can run
 const BY_HAND: Hint = a =>
   `If the user wants to go ahead without the check, they can run ${a.command} themselves in their own terminal. docs-sync only checks the commands that Claude runs.`
 const fetchBase = (remote: string): Hint => () => `Fetch the base branch (git fetch ${remote}) and run again.`
+const addRemote = (repo: string): Hint => () => `Add a remote that points to ${repo} (git remote add <name> <url>), fetch it, and run again.`
+const setHead = (remote: string): Hint => a =>
+  `Give the base branch with --base, or set the default branch of the remote (git remote set-head ${remote} --auto), and run ${a.command} again.`
 
 // 判定できなかったことを表す。ユーザーに続けるか聞く。
 // hints は止めたときに示す手段、files は判定できなかったファイル、
@@ -126,16 +129,35 @@ async function checkPrCreate($: EngineInterface, pr: PrCreate, signal: AbortSign
   const root = await resolveRoot($, pr.cds)
   const head = await resolveHead($, root, pr.head)
   if (head === undefined) throw new CheckFailed(`could not resolve the head ${pr.head ?? 'HEAD'}`)
-  // PR を出す先のリポジトリ(fork の構成なら元のリポジトリ)と、その既定のブランチ。
-  // remote が 1 つで -R もなければ、その remote を使うしかないので gh には問い合わせない
-  const remotes = await remoteRepos($, root)
-  const only = pr.repo === undefined && remotes.names.length === 1 ? remotes.names[0] : undefined
-  const target = only === undefined ? await ghRepo($, root, pr.repo) : undefined
-  const remote = only ?? remoteFor(remotes.repos, target?.repo)
-  const branch = pr.base ?? target?.defaultBranch
+  const { remote, branch } = await prTarget($, root, pr)
   const base = await resolveBase($, root, remote, branch)
   if (base === undefined) throw new CheckFailed(baseFailure(remote, branch), [fetchBase(remote)])
   return check($, root, base, head, signal)
+}
+
+// PR を出す先のリポジトリ(fork の構成なら元のリポジトリ)を指す remote と、base のブランチ
+// (わからなければ undefined で、resolveBase が remote の既定ブランチを探す)
+async function prTarget($: EngineInterface, root: string, pr: PrCreate): Promise<{ remote: string; branch?: string }> {
+  const remotes = await remoteRepos($, root)
+  const flag = pr.repo === undefined ? undefined : ghRepoFlag(pr.repo)
+  if (pr.repo !== undefined && flag === undefined) {
+    // gh に渡せない -R(github.com 以外のホスト)は、そのホストのそのリポジトリを指す remote を使い、既定のブランチは <remote>/HEAD から読む。
+    // 確かめられないものを推測(<remote>/main・origin など)で埋めると、関係のない base と比べることになるので、判定できなかったものとして扱う
+    const host = hostOf(pr.repo)
+    const repo = repoOf(pr.repo)
+    const remote = remotes.names.find(n => host !== undefined && remotes.hosts.get(n) === host && remotes.repos.get(n) === repo)
+    if (remote === undefined) throw new CheckFailed(`no remote points to the repository given with -R (${pr.repo})`, [addRemote(pr.repo)])
+    if (pr.base !== undefined) return { remote, branch: pr.base }
+    const remoteHead = await git($, ['symbolic-ref', '--short', `refs/remotes/${remote}/HEAD`], root)
+    if (remoteHead === undefined || !remoteHead.startsWith(`${remote}/`)) {
+      throw new CheckFailed(`could not tell the default branch of ${pr.repo}, because ${remote}/HEAD is not set`, [setHead(remote)])
+    }
+    return { remote, branch: remoteHead.slice(remote.length + 1) }
+  }
+  // remote が 1 つで -R もなければ、その remote を使うしかないので gh には問い合わせない
+  const only = pr.repo === undefined && remotes.names.length === 1 ? remotes.names[0] : undefined
+  const target = only === undefined ? await ghRepo($, root, flag) : undefined
+  return { remote: only ?? remoteFor(remotes.repos, target?.repo), branch: pr.base ?? target?.defaultBranch }
 }
 
 // コマンドの中の push を順に見て、開いている PR を更新するものを、push するコミットで判定する。
@@ -473,14 +495,45 @@ function withNote(r: ToolCallResult<'Bash'>, note: string): ToolCallResult<'Bash
 const TRUNCATED = Symbol('truncated')
 // 出力をそのまま返す(trim しない)git のサブコマンド
 const RAW_OUTPUT = new Set(['diff', 'show', 'check-attr'])
+// git と gh は、コマンドの許可(権限の確認)より前に、コマンドから読み取った場所で実行する。そのリポジトリの設定(.git/config)は
+// 信用できないので、設定からプログラムを起動しうるもの(fsmonitor・外部 diff・textconv)を止めて実行する。
+// 設定の上書きは GIT_CONFIG_* の環境変数で渡すので、gh が中で実行する git にも効く(git 2.31 以降)。repo の hook は、エンジンが止める
+const GIT_ENV: Record<string, string> = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.fsmonitor', GIT_CONFIG_VALUE_0: 'false' }
+// セッションのリポジトリでないところでは、部分クローンの足りないオブジェクトを remote へ取りに行かない。
+// 取りに行くと、そのリポジトリの設定(core.sshCommand など)が使われる(git 2.44 以降)
+const UNTRUSTED_ENV: Record<string, string> = { ...GIT_ENV, GIT_NO_LAZY_FETCH: '1' }
+const GIT_SUBCOMMAND_OFF: Record<string, string[]> = { diff: ['--no-ext-diff', '--no-textconv'], show: ['--no-textconv'] }
+
+// セッションのリポジトリのルート。Claude Code を起動した場所(/cd などでだけ動き、Bash の cd では動かない)のリポジトリで、
+// Claude Code が自分でも git を実行する場所なので、その設定は信用する。Bash の cd に付いて動く session.cwd は使わない
+// (許可された cd で移った先のリポジトリを、信用することになるため)。
+// 起動した場所ごとに、求められたものを覚えておく(リポジトリでなければ覚えずに、次にまた求める)
+const sessionRoots = new Map<string, string>()
+async function sessionRoot($: EngineInterface): Promise<string | undefined> {
+  const dir = await $.session.root()
+  const known = sessionRoots.get(dir)
+  if (known !== undefined) return known
+  try {
+    const r = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, env: UNTRUSTED_ENV })
+    if (r.exitCode !== 0) return undefined
+    const root = r.stdout.trim()
+    sessionRoots.set(dir, root)
+    return root
+  } catch {
+    return undefined
+  }
+}
 
 // git を cwd で実行し、成功したら stdout を返す。出力が切れたら TRUNCATED、失敗したら undefined
 async function gitOut($: EngineInterface, args: string[], cwd: string, stdin?: string): Promise<string | typeof TRUNCATED | undefined> {
+  const [sub, ...rest] = args
+  const argv = ['git', sub!, ...(GIT_SUBCOMMAND_OFF[sub!] ?? []), ...rest]
   try {
-    const r = await $.process.run(['git', ...args], stdin === undefined ? { cwd } : { cwd, stdin })
+    const env = (await sessionRoot($)) === cwd ? GIT_ENV : UNTRUSTED_ENV
+    const r = await $.process.run(argv, stdin === undefined ? { cwd, env } : { cwd, env, stdin })
     if (r.exitCode !== 0) return undefined
     if (r.isStdoutTruncated) return TRUNCATED
-    return RAW_OUTPUT.has(args[0]!) ? r.stdout : r.stdout.trim()
+    return RAW_OUTPUT.has(sub!) ? r.stdout : r.stdout.trim()
   } catch {
     return undefined
   }
@@ -562,21 +615,24 @@ function baseFailure(remote: string, branch: string | undefined): string {
 }
 
 // names はすべての remote の名前、repos は remote の名前からそれが指すリポジトリ(owner/name、小文字)への対応
-// (URL からリポジトリを読み取れた remote だけ)
-type Remotes = { names: string[]; repos: Map<string, string> }
+// (URL からリポジトリを読み取れた remote だけ)、hosts は remote の名前からそのホスト(小文字)への対応(読み取れた remote だけ)
+type Remotes = { names: string[]; repos: Map<string, string>; hosts: Map<string, string> }
 
 // git remote -v の fetch の行から、remote の一覧を作る。partial clone の remote は行末に [blob:none] などが付く
 async function remoteRepos($: EngineInterface, root: string): Promise<Remotes> {
   const names: string[] = []
   const repos = new Map<string, string>()
+  const hosts = new Map<string, string>()
   for (const line of ((await git($, ['remote', '-v'], root)) ?? '').split('\n')) {
     const m = /^(\S+)\s+(\S+)\s+\(fetch\)(?:\s.*)?$/.exec(line)
     if (m === null) continue
     names.push(m[1]!)
     const repo = repoOf(m[2]!)
     if (repo !== undefined) repos.set(m[1]!, repo)
+    const host = hostOf(m[2]!)
+    if (host !== undefined) hosts.set(m[1]!, host)
   }
-  return { names, repos }
+  return { names, repos, hosts }
 }
 
 // リポジトリ(owner/name)を指す remote。origin が指していれば origin、なければほかの remote から探す。
@@ -587,12 +643,21 @@ function remoteFor(remotes: Map<string, string>, repo: string | undefined): stri
   return 'origin'
 }
 
-// gh が PR を出す先とするリポジトリ(owner/name、小文字)と、その既定のブランチ。-R の指定があればそのリポジトリ。
+// gh に渡す -R / --repo の値。OWNER/REPO はそのまま、github.com を指すもの(URL・SSH の形も)は github.com/OWNER/REPO にする。
+// ほかのホストを指すもの、読み取れないものは undefined。-R の値はまだ許可されていないコマンドから読んだもので、
+// ほかのホストを指す値を渡すと、gh はそのホストへ(そのホスト用のトークンを付けて)問い合わせるため
+export function ghRepoFlag(value: string): string | undefined {
+  if (/^[A-Za-z0-9][\w.-]*\/[\w.-]+$/.test(value)) return value
+  const repo = repoOf(value)
+  return repo !== undefined && hostOf(value) === 'github.com' ? `github.com/${repo}` : undefined
+}
+
+// gh が PR を出す先とするリポジトリ(owner/name、小文字)と、その既定のブランチ。flag(ghRepoFlag で確かめたもの)があればそのリポジトリ。
 // gh で確かめられなければ undefined
 async function ghRepo($: EngineInterface, root: string, flag: string | undefined): Promise<{ repo: string; defaultBranch?: string } | undefined> {
   try {
     const argv = ['gh', 'repo', 'view', ...(flag !== undefined ? [flag] : []), '--json', 'nameWithOwner,defaultBranchRef']
-    const r = await $.process.run(argv, { cwd: root, timeoutMs: GH_TIMEOUT_MS })
+    const r = await $.process.run(argv, { cwd: root, env: UNTRUSTED_ENV, timeoutMs: GH_TIMEOUT_MS })
     if (r.exitCode !== 0) return undefined
     const v = parseJson(r.stdout) as { nameWithOwner?: unknown; defaultBranchRef?: { name?: unknown } } | undefined
     if (typeof v?.nameWithOwner !== 'string') return undefined
@@ -635,6 +700,13 @@ export function repoOf(url: string): string | undefined {
   return m === null ? undefined : `${m[1]}/${m[2]}`.toLowerCase()
 }
 
+// remote の URL や -R の値(https://host/owner/name・ssh://user@host:port/owner/name・user@host:owner/name・host/owner/name)から、
+// ホスト(小文字)を取り出す。owner/name だけのもの、ローカルのパスは undefined
+export function hostOf(url: string): string | undefined {
+  const m = /^(?:[a-z][\w+.-]*:\/\/)?(?:[^@/]*@)?([^/:@]+)(?::\d*)?[:/][^/:]+\/[^/]+?\/?$/i.exec(url)
+  return m === null ? undefined : m[1]!.toLowerCase()
+}
+
 // push する refspec を、push するコミット(src)と push 先のブランチ名(dst)にそろえる。
 // refspec がなければ今のブランチを push する。push 先が upstream の remote ならその upstream のブランチへ、
 // ほかの remote なら同じ名前のブランチへ
@@ -670,7 +742,7 @@ async function openPrs($: EngineInterface, root: string): Promise<OpenPr[] | und
   try {
     const r = await $.process.run(
       ['gh', 'pr', 'list', '--state', 'open', '--limit', '1000', '--json', 'number,url,baseRefName,headRefName,headRepository,headRepositoryOwner'],
-      { cwd: root, timeoutMs: GH_TIMEOUT_MS },
+      { cwd: root, env: UNTRUSTED_ENV, timeoutMs: GH_TIMEOUT_MS },
     )
     if (r.exitCode !== 0 || r.isStdoutTruncated) return undefined
     const list = parseJson(r.stdout)
