@@ -16,6 +16,9 @@ type Pr = { number: number; state: string; baseRefName: string; headRefName: str
 // fork の構成。origin が自分の fork(me/r)、upstream が元のリポジトリ(o/r)
 const FORK_REMOTES = { origin: 'git@github.com:me/r.git', upstream: 'https://github.com/o/r.git' }
 const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName: 'fix/foo' }
+// git は、設定からプログラムを起動しうるもの(fsmonitor・外部 diff・textconv)を止めて実行する
+const GIT_OFF = ['-c', 'core.fsmonitor=false']
+const SUBCOMMAND_OFF: Record<string, string[]> = { diff: ['--no-ext-diff', '--no-textconv'], show: ['--no-textconv'] }
 
 // git・gh と model を差し替え、Bash の実行は「走った」ことだけを記録する。
 // 今のブランチは fix/foo(upstream は origin/fix/foo)。remote は、remotes を省略すると origin(o/r)と fork(me/r)。
@@ -24,6 +27,7 @@ const OPEN_PR: Pr = { number: 5, state: 'OPEN', baseRefName: 'main', headRefName
 // unfetched なら upstream/main はまだ fetch していない。partial は partial clone の remote の名前
 // files はファイルごとの差分(差分全体はそれをつなげたもの)。binary はバイナリ、generated は linguist-generated のファイル。
 // truncated なら、差分全体の出力が 4 MiB を超えて切れる。unreadable はファイルごとの差分を取れないファイル
+// git は GIT_OFF・SUBCOMMAND_OFF を外して calls.git に記録する。付いていない git は失敗させ、calls.unsafe に記録する
 function world(
   on: On,
   opts: {
@@ -46,7 +50,7 @@ function world(
 ) {
   const remotes = opts.remotes ?? { origin: 'git@github.com:o/r.git', fork: 'https://github.com/me/r.git' }
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
-  const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[] }
+  const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[], unsafe: [] as string[] }
 
   mock.store(on)
   on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
@@ -75,7 +79,13 @@ function world(
       return ok(JSON.stringify(open))
     }
     if (cmd !== 'git') return fail
-    const sub = args.join(' ')
+    const name = args[GIT_OFF.length] ?? ''
+    const off = [...GIT_OFF, name, ...(SUBCOMMAND_OFF[name] ?? [])]
+    if (off.some((a, i) => args[i] !== a)) {
+      calls.unsafe.push(args.join(' '))
+      return fail
+    }
+    const sub = [name, ...args.slice(off.length)].join(' ')
     calls.git.push(sub)
     if (sub === 'rev-parse --show-toplevel') {
       calls.cwds.push(e.init?.cwd ?? '')
@@ -109,15 +119,15 @@ function world(
     }
     const one = /^diff --no-color --no-renames \S+ -- :\(literal\)(.+)$/.exec(sub)
     if (one !== null) return opts.unreadable?.includes(one[1]!) === true ? fail : ok(opts.files?.[one[1]!] ?? '')
-    if (args[0] === 'check-attr') {
+    if (name === 'check-attr') {
       const paths = (e.init?.stdin ?? '').split('\0').filter(f => f !== '')
       const generated = (f: string) => (opts.generated?.includes(f) === true ? 'set' : 'unspecified')
       return ok(paths.flatMap(f => [f, 'linguist-generated', generated(f), f, 'linguist-vendored', 'unspecified']).join('\0') + '\0')
     }
     if (/^diff --name-only (origin|upstream)\/main\.\.\.\w+$/.test(sub)) return ok('src/cli.ts\n')
     if (sub.startsWith('ls-tree -r --name-only')) return ok([...Object.keys(docs), 'src/cli.ts'].join('\n') + '\n')
-    if (args[0] === 'show') {
-      const path = args[1]!.replace(/^\w+:/, '')
+    if (name === 'show') {
+      const path = args[off.length]!.replace(/^\w+:/, '')
       return path in docs ? ok(docs[path]!) : fail
     }
     return fail
@@ -281,6 +291,23 @@ describe('docs-sync', () => {
     await $.tool.call({ tool: 'Bash', command: 'gh pr create -R me/r --fill' })
     expect(calls.gh).toEqual(['repo view me/r --json nameWithOwner,defaultBranchRef'])
     expect(calls.git).toContain(`diff --no-color origin/main...${HEAD}`)
+  })
+
+  test('passes -R with github.com to gh repo view', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create -R https://github.com/o/r --fill' })
+    expect(calls.gh).toEqual(['repo view https://github.com/o/r --json nameWithOwner,defaultBranchRef'])
+  })
+
+  test('does not pass -R with another host to gh, and uses the default branch of the remote for that repository', async ($, on) => {
+    const calls = world(on, { remotes: FORK_REMOTES, model: OK })
+    for (const repo of ['evil.example/o/r', 'https://evil.example/o/r', 'git@evil.example:o/r.git']) {
+      await $.tool.call({ tool: 'Bash', command: `gh pr create -R ${repo} --fill` })
+    }
+    expect(calls.gh).toEqual([])
+    expect(calls.ran).toHaveLength(3)
+    // 2 回目からは、同じ base(upstream/main)で通ったコミットなので判定し直さない
+    expect(calls.git.filter(c => c.startsWith('diff --no-color '))).toEqual([`diff --no-color upstream/main...${HEAD}`])
   })
 
   test('falls back to origin when gh repo view fails', async ($, on) => {
@@ -463,6 +490,15 @@ describe('docs-sync on a large diff', () => {
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual(['gh pr create --fill'])
     expect(r.context?.[0]).toContain('found no mismatch')
+  })
+
+  test('runs every git command with fsmonitor, external diff and textconv turned off', async ($, on) => {
+    const calls = world(on, { files: { 'src/cli.ts': '+ renamed --fast to --quick\n' }, truncated: true, model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(r.context?.[0]).toContain('found no mismatch')
+    expect(calls.unsafe).toEqual([])
+    expect(calls.git).toContain(`diff --no-color --no-renames origin/main...${HEAD} -- :(literal)src/cli.ts`)
+    expect(calls.git).toContain(`show ${HEAD}:README.md`)
   })
 
   test('asks the user about the files it could not check, and remembers the choice for the commit', async ($, on) => {

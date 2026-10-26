@@ -473,11 +473,18 @@ function withNote(r: ToolCallResult<'Bash'>, note: string): ToolCallResult<'Bash
 const TRUNCATED = Symbol('truncated')
 // 出力をそのまま返す(trim しない)git のサブコマンド
 const RAW_OUTPUT = new Set(['diff', 'show', 'check-attr'])
+// git は、コマンドの許可(権限の確認)より前に、コマンドから読み取った場所で実行する。そのリポジトリの設定(.git/config)は
+// 信用できないので、設定からプログラムを起動しうるもの(fsmonitor・外部 diff・textconv)を止めて実行する。
+// repo の hook は、エンジンが止める
+const GIT_CONFIG_OFF = ['-c', 'core.fsmonitor=false']
+const GIT_SUBCOMMAND_OFF: Record<string, string[]> = { diff: ['--no-ext-diff', '--no-textconv'], show: ['--no-textconv'] }
 
 // git を cwd で実行し、成功したら stdout を返す。出力が切れたら TRUNCATED、失敗したら undefined
 async function gitOut($: EngineInterface, args: string[], cwd: string, stdin?: string): Promise<string | typeof TRUNCATED | undefined> {
+  const [sub, ...rest] = args
+  const argv = ['git', ...GIT_CONFIG_OFF, sub!, ...(GIT_SUBCOMMAND_OFF[sub!] ?? []), ...rest]
   try {
-    const r = await $.process.run(['git', ...args], stdin === undefined ? { cwd } : { cwd, stdin })
+    const r = await $.process.run(argv, stdin === undefined ? { cwd } : { cwd, stdin })
     if (r.exitCode !== 0) return undefined
     if (r.isStdoutTruncated) return TRUNCATED
     return RAW_OUTPUT.has(args[0]!) ? r.stdout : r.stdout.trim()
@@ -587,9 +594,18 @@ function remoteFor(remotes: Map<string, string>, repo: string | undefined): stri
   return 'origin'
 }
 
+// gh に渡してよい -R / --repo の値。OWNER/REPO か、github.com の OWNER/REPO(https:// 付きも)だけ
+const GH_REPO_FLAG = /^(?:(?:https:\/\/)?github\.com\/)?[A-Za-z0-9][\w.-]*\/[\w.-]+$/i
+
 // gh が PR を出す先とするリポジトリ(owner/name、小文字)と、その既定のブランチ。-R の指定があればそのリポジトリ。
 // gh で確かめられなければ undefined
 async function ghRepo($: EngineInterface, root: string, flag: string | undefined): Promise<{ repo: string; defaultBranch?: string } | undefined> {
+  // -R の値は、まだ許可されていないコマンドから読んだもの。github.com 以外のホストを指すもの(HOST/OWNER/REPO・URL など)を渡すと、
+  // gh はそのホストへ(そのホスト用のトークンを付けて)問い合わせるので、渡さない。そのリポジトリを指す remote の既定ブランチを使う
+  if (flag !== undefined && !GH_REPO_FLAG.test(flag)) {
+    const repo = repoOf(flag)
+    return repo === undefined ? undefined : { repo }
+  }
   try {
     const argv = ['gh', 'repo', 'view', ...(flag !== undefined ? [flag] : []), '--json', 'nameWithOwner,defaultBranchRef']
     const r = await $.process.run(argv, { cwd: root, timeoutMs: GH_TIMEOUT_MS })
