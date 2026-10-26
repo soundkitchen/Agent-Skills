@@ -504,18 +504,20 @@ const GIT_ENV: Record<string, string> = { GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_
 const UNTRUSTED_ENV: Record<string, string> = { ...GIT_ENV, GIT_NO_LAZY_FETCH: '1' }
 const GIT_SUBCOMMAND_OFF: Record<string, string[]> = { diff: ['--no-ext-diff', '--no-textconv'], show: ['--no-textconv'] }
 
-// セッションのリポジトリのルート。Claude Code が自分でも git を実行する場所なので、その設定は信用する。
-// セッションの cwd ごとに、求められたものを覚えておく(リポジトリでなければ覚えずに、次にまた求める)
+// セッションのリポジトリのルート。Claude Code を起動した場所(/cd などでだけ動き、Bash の cd では動かない)のリポジトリで、
+// Claude Code が自分でも git を実行する場所なので、その設定は信用する。Bash の cd に付いて動く session.cwd は使わない
+// (許可された cd で移った先のリポジトリを、信用することになるため)。
+// 起動した場所ごとに、求められたものを覚えておく(リポジトリでなければ覚えずに、次にまた求める)
 const sessionRoots = new Map<string, string>()
 async function sessionRoot($: EngineInterface): Promise<string | undefined> {
-  const cwd = await $.session.cwd()
-  const known = sessionRoots.get(cwd)
+  const dir = await $.session.root()
+  const known = sessionRoots.get(dir)
   if (known !== undefined) return known
   try {
-    const r = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd, env: UNTRUSTED_ENV })
+    const r = await $.process.run(['git', 'rev-parse', '--show-toplevel'], { cwd: dir, env: UNTRUSTED_ENV })
     if (r.exitCode !== 0) return undefined
     const root = r.stdout.trim()
-    sessionRoots.set(cwd, root)
+    sessionRoots.set(dir, root)
     return root
   } catch {
     return undefined

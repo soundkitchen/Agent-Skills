@@ -36,11 +36,13 @@ function configOf(env: Record<string, string> | undefined, key: string): string 
 // remoteHeads は <remote>/HEAD が指すブランチ(省略すると origin だけ main)、refs はほかに解決できる ref とそのコミット
 // git は SUBCOMMAND_OFF を外して calls.git に記録する(GIT_NO_LAZY_FETCH 付きなら calls.noLazy にも)。
 // fsmonitor・外部 diff・textconv を止めていない git と gh は失敗させ、calls.unsafe に記録する。
-// calls.cwds は、セッションの cwd 以外で git rev-parse --show-toplevel を実行した場所
+// root は Claude Code を起動した場所(省略すると cwd と同じ)。cwd は、それまでの cd で動いたセッションの cwd
+// calls.cwds は、起動した場所以外で git rev-parse --show-toplevel を実行した場所
 function world(
   on: On,
   opts: {
     cwd?: string
+    root?: string
     diff?: string
     docs?: Record<string, string>
     prs?: Pr[]
@@ -66,6 +68,7 @@ function world(
 
   mock.store(on)
   on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
+  on('session.root', async () => ({ value: opts.root ?? opts.cwd ?? ROOT }))
   on('session.model', async () => ({ value: SESSION_MODEL }))
 
   on('process.run', async ($, e) => {
@@ -106,7 +109,7 @@ function world(
     calls.git.push(sub)
     if (e.init?.env?.['GIT_NO_LAZY_FETCH'] === '1') calls.noLazy.push(sub)
     if (sub === 'rev-parse --show-toplevel') {
-      if (e.init?.cwd !== (opts.cwd ?? ROOT)) calls.cwds.push(e.init?.cwd ?? '')
+      if (e.init?.cwd !== (opts.root ?? opts.cwd ?? ROOT)) calls.cwds.push(e.init?.cwd ?? '')
       // 展開されていない変数を含む場所は、リポジトリとして見つからない
       if (e.init?.cwd?.includes('$') === true) return fail
       return ok(`${e.init?.cwd?.endsWith('/other') ? '/other' : ROOT}\n`)
@@ -368,6 +371,12 @@ describe('docs-sync', () => {
     await $.tool.call({ tool: 'Bash', command: 'cd ../other && gh pr create --fill' })
     expect(calls.noLazy).toContain(`diff --no-color origin/main...${HEAD}`)
     expect(calls.noLazy).toContain(`show ${HEAD}:README.md`)
+  })
+
+  test('does not trust a repository that an earlier cd moved the session cwd to', async ($, on) => {
+    const calls = world(on, { root: ROOT, cwd: `${ROOT}/../other`, model: OK })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.noLazy).toContain(`diff --no-color origin/main...${HEAD}`)
   })
 
   test('falls back to origin when gh repo view fails', async ($, on) => {

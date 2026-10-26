@@ -77,7 +77,7 @@ ln -s "$PWD/docs-sync" ~/.claude/skills/docs-sync
 - インストールしてあるかぎり、どのプロジェクトでも動く。止めたいプロジェクトでは、`.claude/settings.local.json` の `enabledPlugins` に `"docs-sync@skills-dir": false` を書く
 - 判定は、Claude のコマンドが許可される前(権限の確認ダイアログが出る前)に行う。そのため、まだ許可されていないコマンドに書かれた場所や値を信用しない
   - git と gh は、コマンドの `cd` などで移った先のリポジトリで実行する。そのリポジトリの設定からプログラムが起動しないように、fsmonitor・外部 diff(`diff.external` など)・textconv を止めて実行する(repo の hook は Claude Code が止める)。fsmonitor は `GIT_CONFIG_*` の環境変数で止めるので、gh が中で実行する git にも効く(git 2.31 以降)
-  - 部分クローン(`--filter=blob:none` など)で足りないオブジェクトを remote へ取りに行くのは、セッションのリポジトリ(Claude Code を起動した場所のリポジトリ)だけ。ほかのリポジトリでは、取りに行くときにそのリポジトリの設定(`core.sshCommand` など)が使われるので、取りに行かない(`GIT_NO_LAZY_FETCH`、git 2.44 以降)。足りないオブジェクトがあると差分を取れず、判定できなかったとして扱う
+  - 部分クローン(`--filter=blob:none` など)で足りないオブジェクトを remote へ取りに行くのは、セッションのリポジトリ(Claude Code を起動した場所のリポジトリ。`/cd` では移るが、Claude が Bash で `cd` しても移らない)だけ。ほかのリポジトリでは、取りに行くときにそのリポジトリの設定(`core.sshCommand` など)が使われるので、取りに行かない(`GIT_NO_LAZY_FETCH`、git 2.44 以降)。足りないオブジェクトがあると差分を取れず、判定できなかったとして扱う
   - `-R` / `--repo` の値は、`OWNER/REPO` か github.com のリポジトリ(URL・SSH の形も)のときだけ gh に渡す。ほかのホストを指す値を渡すと、gh がそのホストへ(そのホスト用のトークンを付けて)問い合わせてしまうため。GitHub Enterprise のリポジトリを `-R HOST/OWNER/REPO` で指定するときは、そのリポジトリを指す remote を用意し、`--base` を付けるか、その remote の `<remote>/HEAD` を設定しておく(`git remote set-head <remote> --auto`)
 
 ## 開発
