@@ -1,9 +1,11 @@
-import type { EngineInterface, ModelCompleteResult, Register, ToolCallResult } from 'claude-code'
+import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
 
 // 判定の上限。モデルは作業中のセッションと同じものを使う。
 // thinking のトークンも上限に数えられ、effort の既定が高いモデル(Fable 5.2 は high)は大きな差分で多く考えるので、
 // 上限が小さいと本文が出る前に止まる(empty-reply)。effort はモデルの既定のままにして、上限で余地を取る
 const MAX_TOKENS = 32000
+// 出力の上限が MAX_TOKENS より小さいモデルでは、MAX_TOKENS を渡すと呼び出しが拒否されるので、この上限でもう一度呼ぶ
+const FALLBACK_MAX_TOKENS = 4096
 // 返答はまとめて返るので、上限を使い切るほど考えると時間がかかる。provider が 10 分で打ち切るので、それに合わせる
 const JUDGE_TIMEOUT_MS = 10 * 60 * 1000
 // 1 回の判定に渡すテキストの上限(文字数)。超えたら関係するドキュメントを先に選ばせ、差分を分けて判定する
@@ -782,20 +784,9 @@ async function readDocs($: EngineInterface, root: string, head: string): Promise
 async function selectDocs($: EngineInterface, model: string, docs: Doc[], room: number, changed: string, signal: AbortSignal): Promise<Doc[]> {
   if (docs.reduce((n, d) => n + d.text.length, 0) <= room) return docs
 
-  const r = await $.model.complete(
-    {
-      model,
-      system: SELECT_SYSTEM,
-      prompt: selectPrompt(docs, changed),
-      maxTokens: MAX_TOKENS,
-      timeoutMs: JUDGE_TIMEOUT_MS,
-    },
-    { signal },
-  )
-  if (!r.isAnswered) throw new CheckFailed(`model call failed (${whyNoReply(r)})`, [RETRY])
-
+  const r = await complete($, model, SELECT_SYSTEM, selectPrompt(docs, changed), signal)
   const wanted = parseJson(r.text)
-  if (!Array.isArray(wanted)) throw new CheckFailed('could not read the model reply', [RETRY])
+  if (!Array.isArray(wanted)) throw unreadable(r)
   const names = new Set(wanted.map(p => normalizePath(String(p))))
   const picked = docs.filter(d => names.has(d.path))
 
@@ -812,11 +803,46 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], room: 
   return out
 }
 
-// モデルの返答が得られなかった理由。本文のない返答は、上限まで考えて止まったのかが分かるように、出力したトークン数を添える
-function whyNoReply(r: Extract<ModelCompleteResult, { isAnswered: false }>): string {
-  if (r.reason !== 'empty-reply') return r.reason
+// モデルの返答。cap はその呼び出しの出力の上限、used は出力したトークン数(thinking を含む)
+type Reply = { text: string; cap: number; used: number }
+
+// モデルを呼んで本文を返す。本文が得られなければ、理由を添えて CheckFailed にする
+async function complete($: EngineInterface, model: string, system: string, prompt: string, signal: AbortSignal): Promise<Reply> {
+  const call = (cap: number) => $.model.complete({ model, system, prompt, maxTokens: cap, timeoutMs: JUDGE_TIMEOUT_MS }, { signal })
+  const start = Date.now()
+  let cap = MAX_TOKENS
+  let r: Awaited<ReturnType<typeof call>>
+  try {
+    r = await call(cap)
+  } catch {
+    // 拒否された呼び出しは送られていないので、小さい上限でもう一度呼ぶ。それでも拒否されたら判定できない
+    cap = FALLBACK_MAX_TOKENS
+    try {
+      r = await call(cap)
+    } catch (err) {
+      throw new CheckFailed(`the model call was refused (${err instanceof Error ? err.message : String(err)})`)
+    }
+  }
+  if (r.isAnswered) return { text: r.text, cap, used: r.usage.output_tokens }
+
+  // 本文のない返答は、上限まで考えて止まったのかが分かるように、出力したトークン数を添える
   const used = r.usage.output_tokens
-  return used >= MAX_TOKENS ? `empty-reply: the model used all ${MAX_TOKENS} output tokens before writing an answer` : `empty-reply after ${used} output tokens`
+  const why =
+    r.reason === 'empty-reply'
+      ? used >= cap
+        ? `empty-reply: the model used all ${cap} output tokens before writing an answer`
+        : `empty-reply after ${used} output tokens`
+      : // 時間切れも aborted になるので、取り消されていないのに時間を使い切ったものは、時間切れとして伝える
+        r.reason === 'aborted' && !signal.aborted && Date.now() - start >= JUDGE_TIMEOUT_MS
+        ? `timed out after ${JUDGE_TIMEOUT_MS / 60_000} minutes`
+        : r.reason
+  throw new CheckFailed(`model call failed (${why})`, [RETRY])
+}
+
+// 返答を読めなかったことを表す。上限まで出力していれば、本文が途中で切れたことを添える
+function unreadable(r: Reply): CheckFailed {
+  const cut = r.used >= r.cap ? ` (it was cut off at the limit of ${r.cap} output tokens)` : ''
+  return new CheckFailed(`could not read the model reply${cut}`, [RETRY])
 }
 
 // 差分を分けて判定するときの、何回目か(index / count)と、ブランチ全体の変更されたファイルの一覧
@@ -824,18 +850,8 @@ type PartContext = { index: number; count: number; changed: string }
 
 // ずれの指摘を返す。ずれがなければ空。part があれば、差分の一部として判定させる
 async function judge($: EngineInterface, model: string, docs: Doc[], diff: string, signal: AbortSignal, part?: PartContext): Promise<Finding[]> {
-  const r = await $.model.complete(
-    {
-      model,
-      system: part === undefined ? JUDGE_SYSTEM : `${JUDGE_SYSTEM}\n\n${JUDGE_PART}`,
-      prompt: judgePrompt(docs, diff, part),
-      maxTokens: MAX_TOKENS,
-      timeoutMs: JUDGE_TIMEOUT_MS,
-    },
-    { signal },
-  )
-  if (!r.isAnswered) throw new CheckFailed(`model call failed (${whyNoReply(r)})`, [RETRY])
-
+  const system = part === undefined ? JUDGE_SYSTEM : `${JUDGE_SYSTEM}\n\n${JUDGE_PART}`
+  const r = await complete($, model, system, judgePrompt(docs, diff, part), signal)
   const v = parseJson(r.text) as { status?: unknown; findings?: unknown } | undefined
   if (v?.status === 'ok') return []
   if (v?.status === 'drift' && Array.isArray(v.findings) && v.findings.length > 0) {
@@ -845,7 +861,7 @@ async function judge($: EngineInterface, model: string, docs: Doc[], diff: strin
       fix: String(f?.fix ?? ''),
     }))
   }
-  throw new CheckFailed('could not read the model reply', [RETRY])
+  throw unreadable(r)
 }
 
 // 判定できなかったとき、続けるかをユーザーに聞く。答えられない(-p 実行・閉じた)ときは中止。

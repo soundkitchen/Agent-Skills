@@ -10,8 +10,8 @@ const HEAD = 'abc123'
 const FEATURE_HEAD = 'f00d42'
 const SESSION_MODEL = 'claude-opus-5-5'
 
-// outputTokens は、本文のない返答までに出力したトークン数(省略時は 0)
-type Model = (prompt: string) => { text: string } | { reason: 'empty-reply'; outputTokens?: number }
+// outputTokens は、出力したトークン数(省略時は 0)
+type Model = (prompt: string) => { text: string; outputTokens?: number } | { reason: 'empty-reply'; outputTokens?: number }
 // PR の head のリポジトリは、owner を省略すると o/r。PR を出した先のリポジトリは o/r
 type Pr = { number: number; state: string; baseRefName: string; headRefName: string; owner?: string }
 // fork の構成。origin が自分の fork(me/r)、upstream が元のリポジトリ(o/r)
@@ -59,12 +59,14 @@ function world(
     unreadable?: string[]
     remoteHeads?: Record<string, string>
     refs?: Record<string, string>
+    // モデルの出力の上限。これを超える maxTokens の呼び出しは拒否する
+    outputLimit?: number
     model: Model
   },
 ) {
   const remotes = opts.remotes ?? { origin: 'git@github.com:o/r.git', fork: 'https://github.com/me/r.git' }
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
-  const calls = { model: 0, models: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[], unsafe: [] as string[], noLazy: [] as string[] }
+  const calls = { model: 0, models: [] as string[], maxTokens: [] as number[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[], unsafe: [] as string[], noLazy: [] as string[] }
   const remoteHeads = opts.remoteHeads ?? { origin: 'main' }
 
   mock.store(on)
@@ -162,10 +164,12 @@ function world(
   })
 
   on('model.complete', async ($, e) => {
+    calls.maxTokens.push(e.maxTokens ?? 0)
+    if (opts.outputLimit !== undefined && (e.maxTokens ?? 0) > opts.outputLimit) throw new Error(`maxTokens is over the limit of ${opts.outputLimit}`)
     calls.model += 1
     calls.models.push(e.model)
     const r = opts.model(e.prompt)
-    const output = 'reason' in r ? (r.outputTokens ?? 0) : 0
+    const output = r.outputTokens ?? 0
     const usage = { input_tokens: 0, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     return 'text' in r
       ? { value: { isAnswered: true, text: r.text, usage } }
@@ -625,6 +629,30 @@ describe('docs-sync on a large diff', () => {
     expect(calls.model).toBe(2)
     expect(r.deny).toContain('a part failed: model call failed (empty-reply after 0 output tokens)')
     expect(r.deny).toContain(`Run gh pr create again`)
+  })
+
+  test('calls again with a smaller cap when the model refuses the cap for being over its output limit', async ($, on) => {
+    const calls = world(on, { outputLimit: 8192, model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(r.deny).toBeUndefined()
+    expect(calls.ran).toEqual(['gh pr create --fill'])
+    expect(calls.maxTokens).toEqual([32000, 4096])
+  })
+
+  test('says the model call was refused when even the smaller cap is refused', async ($, on) => {
+    const calls = world(on, { outputLimit: 1024, model: OK })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual([])
+    expect(calls.maxTokens).toEqual([32000, 4096])
+    // テストでは、投げた hook が飛ばされて別の理由で拒否されるので、理由の文言までは見ない
+    expect(r.deny).toContain('the model call was refused (')
+  })
+
+  test('says the reply was cut off when the model reaches the cap in the middle of its answer', async ($, on) => {
+    const calls = world(on, { model: () => ({ text: '{"status":"dri', outputTokens: 32000 }) })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual([])
+    expect(r.deny).toContain('could not read the model reply (it was cut off at the limit of 32000 output tokens)')
   })
 
   test('says the model used up its output tokens when it stops before writing an answer', async ($, on) => {
