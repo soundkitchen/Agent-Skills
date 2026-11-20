@@ -66,7 +66,7 @@ function world(
 ) {
   const remotes = opts.remotes ?? { origin: 'git@github.com:o/r.git', fork: 'https://github.com/me/r.git' }
   const docs = opts.docs ?? { 'README.md': '# Tool\n\nRun `tool --fast`.\n' }
-  const calls = { model: 0, models: [] as string[], maxTokens: [] as number[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[], unsafe: [] as string[], noLazy: [] as string[] }
+  const calls = { model: 0, models: [] as string[], maxTokens: [] as number[], systems: [] as string[], ran: [] as string[], git: [] as string[], gh: [] as string[], cwds: [] as string[], unsafe: [] as string[], noLazy: [] as string[] }
   const remoteHeads = opts.remoteHeads ?? { origin: 'main' }
 
   mock.store(on)
@@ -165,6 +165,7 @@ function world(
 
   on('model.complete', async ($, e) => {
     calls.maxTokens.push(e.maxTokens ?? 0)
+    calls.systems.push(e.system ?? '')
     if (opts.outputLimit !== undefined && (e.maxTokens ?? 0) > opts.outputLimit) throw new Error(`maxTokens is over the limit of ${opts.outputLimit}`)
     calls.model += 1
     calls.models.push(e.model)
@@ -653,6 +654,16 @@ describe('docs-sync on a large diff', () => {
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual([])
     expect(r.deny).toContain('could not read the model reply (it was cut off at the limit of 32000 output tokens)')
+  })
+
+  test('asks for the findings in English in every part, so that the parts do not mix languages', async ($, on) => {
+    const calls = world(on, {
+      files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/c.ts': big('c') },
+      model: OK,
+    })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.model).toBe(2)
+    for (const system of calls.systems) expect(system).toContain('Write "issue" and "fix" in English')
   })
 
   test('says the model used up its output tokens when it stops before writing an answer', async ($, on) => {
