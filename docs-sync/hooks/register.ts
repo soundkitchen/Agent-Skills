@@ -809,9 +809,12 @@ type Reply = { text: string; cap: number; used: number }
 
 // モデルを呼んで本文を返す。本文が得られなければ、理由を添えて CheckFailed にする
 async function complete($: EngineInterface, model: string, system: string, prompt: string, signal: AbortSignal): Promise<Reply> {
-  const call = (cap: number) => $.model.complete({ model, system, prompt, maxTokens: cap, timeoutMs: JUDGE_TIMEOUT_MS }, { signal })
-  // 経過時間は $.clock で測る(テストでは時計を差し替えて、時間切れを起こせる)
-  const start = await $.clock.now()
+  // 経過時間は呼び出しごとに測る(拒否されて呼び直したときに、前の呼び出しの時間を含めない)
+  let start: number | undefined
+  const call = async (cap: number) => {
+    start = await clockNow($)
+    return $.model.complete({ model, system, prompt, maxTokens: cap, timeoutMs: JUDGE_TIMEOUT_MS }, { signal })
+  }
   let cap = MAX_TOKENS
   let r: Awaited<ReturnType<typeof call>>
   try {
@@ -835,16 +838,33 @@ async function complete($: EngineInterface, model: string, system: string, promp
         ? `empty-reply: the model used all ${cap} output tokens before writing an answer`
         : `empty-reply after ${used} output tokens`
       : r.reason === 'aborted'
-        ? // 取り消されたあとは、時計を読まない(経過時間によらず aborted になる)
-          abortReason(signal.aborted, signal.aborted ? 0 : (await $.clock.now()) - start)
+        ? abortReason(signal.aborted, await elapsedSince($, signal, start))
         : r.reason
   throw new CheckFailed(`model call failed (${why})`, [RETRY])
 }
 
+// 今の時刻。$.clock は dispatch なので失敗しうる。失敗したら undefined を返す
+// (時刻が読めないだけで、判定や、ほかの回で集めた指摘を捨てない)
+async function clockNow($: EngineInterface): Promise<number | undefined> {
+  try {
+    return await $.clock.now()
+  } catch {
+    return undefined
+  }
+}
+
+// start からの経過時間。取り消されたあとは時計を読まない(経過時間によらず aborted になる)。分からなければ undefined
+async function elapsedSince($: EngineInterface, signal: AbortSignal, start: number | undefined): Promise<number | undefined> {
+  if (signal.aborted || start === undefined) return undefined
+  const now = await clockNow($)
+  return now === undefined ? undefined : now - start
+}
+
 // aborted で終わった呼び出しの理由。時間切れも aborted になるので、取り消されていないのに
-// 時間を使い切ったものは、時間切れとして伝える。cancelled は signal が取り消されたか、elapsed は呼び出しにかかった時間
-export function abortReason(cancelled: boolean, elapsed: number): string {
-  return !cancelled && elapsed >= JUDGE_TIMEOUT_MS ? `timed out after ${JUDGE_TIMEOUT_MS / 60_000} minutes` : 'aborted'
+// 時間を使い切ったものは、時間切れとして伝える。cancelled は signal が取り消されたか、
+// elapsed は呼び出しにかかった時間(分からなければ undefined で、時間切れとはみなさない)
+export function abortReason(cancelled: boolean, elapsed: number | undefined): string {
+  return !cancelled && elapsed !== undefined && elapsed >= JUDGE_TIMEOUT_MS ? `timed out after ${JUDGE_TIMEOUT_MS / 60_000} minutes` : 'aborted'
 }
 
 // 返答を読めなかったことを表す。上限まで出力していれば、本文が途中で切れたことを添える

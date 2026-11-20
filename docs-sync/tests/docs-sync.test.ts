@@ -61,6 +61,10 @@ function world(
     refs?: Record<string, string>
     // モデルの出力の上限。これを超える maxTokens の呼び出しは拒否する
     outputLimit?: number
+    // 拒否するまでにかかる時間(ミリ秒)。その分だけ時計を進めてから拒否する
+    refusedElapsed?: number
+    // true なら時計を差し替えず、$.clock.now() を失敗させる
+    clockFails?: boolean
     model: Model
   },
 ) {
@@ -70,7 +74,7 @@ function world(
   const remoteHeads = opts.remoteHeads ?? { origin: 'main' }
 
   mock.store(on)
-  const clock = mock.clock(on)
+  const clock = opts.clockFails ? undefined : mock.clock(on)
   on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
   on('session.root', async () => ({ value: opts.root ?? opts.cwd ?? ROOT }))
   on('session.model', async () => ({ value: SESSION_MODEL }))
@@ -167,11 +171,14 @@ function world(
   on('model.complete', async ($, e) => {
     calls.maxTokens.push(e.maxTokens ?? 0)
     calls.systems.push(e.system ?? '')
-    if (opts.outputLimit !== undefined && (e.maxTokens ?? 0) > opts.outputLimit) throw new Error(`maxTokens is over the limit of ${opts.outputLimit}`)
+    if (opts.outputLimit !== undefined && (e.maxTokens ?? 0) > opts.outputLimit) {
+      if (opts.refusedElapsed !== undefined) await clock?.set(clock.now() + opts.refusedElapsed)
+      throw new Error(`maxTokens is over the limit of ${opts.outputLimit}`)
+    }
     calls.model += 1
     calls.models.push(e.model)
     const r = opts.model(e.prompt)
-    if (r.elapsed !== undefined) await clock.set(clock.now() + r.elapsed)
+    if (r.elapsed !== undefined) await clock?.set(clock.now() + r.elapsed)
     const output = r.outputTokens ?? 0
     const usage = { input_tokens: 0, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     return 'text' in r
@@ -741,6 +748,33 @@ describe('docs-sync on a large diff', () => {
     expect(r.deny).not.toContain('timed out')
   })
 
+  test('does not count the time of a refused call when the call made again times out', async ($, on) => {
+    const calls = world(on, {
+      outputLimit: 8192,
+      refusedElapsed: 9 * 60 * 1000,
+      model: () => ({ reason: 'aborted', elapsed: 2 * 60 * 1000 }),
+    })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual([])
+    expect(calls.maxTokens).toEqual([32000, 4096])
+    expect(r.deny).toContain('model call failed (aborted)')
+    expect(r.deny).not.toContain('timed out')
+  })
+
+  test('keeps the findings of the other parts when the clock cannot be read after a part is aborted', async ($, on) => {
+    const calls = world(on, {
+      files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/c.ts': big('c') },
+      clockFails: true,
+      model: prompt => (partOf(prompt) === '2' ? { reason: 'aborted' } : DRIFT(prompt)),
+    })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual([])
+    expect(calls.model).toBe(2)
+    // 時計を読めなくても、1 回目の指摘は捨てず、判定できなかった回のファイルを示す
+    expect(r.deny).toContain('README.md: says --fast but the CLI now takes --quick')
+    expect(r.deny).toContain('these changed files were not checked: src/c.ts')
+  })
+
   test('tells Claude to run again, not that the file is too large, when git diff fails for a file', async ($, on) => {
     const calls = world(on, {
       files: { 'src/a.ts': section('src/a.ts', '+ a\n'), 'src/b.ts': section('src/b.ts', '+ b\n') },
@@ -1143,5 +1177,9 @@ describe('abortReason', () => {
 
   test('says aborted when the call ended before the time limit', () => {
     expect(abortReason(false, LIMIT - 1)).toBe('aborted')
+  })
+
+  test('says aborted when the time the call took is not known', () => {
+    expect(abortReason(false, undefined)).toBe('aborted')
   })
 })
