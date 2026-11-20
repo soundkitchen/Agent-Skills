@@ -635,6 +635,22 @@ describe('docs-sync on a large diff', () => {
     expect(r.deny).toContain('apply all of them together')
   })
 
+  test('treats differently written paths of the same document as one, and leaves out findings without a document', async ($, on) => {
+    const finding = (doc: string, issue: string) => ({ doc, issue, fix: '' })
+    world(on, {
+      files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/c.ts': big('c') },
+      model: prompt => {
+        const findings = partOf(prompt) === '1' ? [finding('README.md', 'one'), finding('', 'no doc one')] : [finding('/README.md', 'two'), finding('', 'no doc two')]
+        return { text: JSON.stringify({ status: 'drift', findings }) }
+      },
+    })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    const lines = (r.deny ?? '').split('\n').filter(l => l.startsWith('- '))
+    expect(lines).toEqual(['- README.md: one', '- /README.md: two', '- (no document given): no doc one', '- (no document given): no doc two'])
+    expect(r.deny).toContain('more than one part (README.md).')
+    expect(r.deny).toContain('If two of them point at the same change, make that change once.')
+  })
+
   test('does not ask to apply findings together when the same part reports them', async ($, on) => {
     const finding = (issue: string) => ({ doc: 'README.md', issue, fix: '' })
     world(on, {

@@ -1342,8 +1342,9 @@ export function parseJson(text: string): unknown {
   }
 }
 
+// モデルが返したパスの書き方の揺れ(前後の空白、先頭の ./ や /、重なった /)を揃える
 function normalizePath(path: string): string {
-  return path.trim().replace(/^\.\//, '')
+  return path.trim().replace(/\/{2,}/g, '/').replace(/^(\.\/|\/)+/, '')
 }
 
 // ファイルの一覧を、長くなりすぎないように先頭の 10 件までにして並べる
@@ -1359,12 +1360,16 @@ export function driftDeny(action: Action, findings: Finding[], unchecked: string
     const key = normalizePath(f.doc)
     byDoc.set(key, [...(byDoc.get(key) ?? []), f])
   }
-  const lines = [...byDoc.values()].flat().map(f => `- ${f.doc}: ${f.issue}${f.fix ? ` (suggested fix: ${f.fix})` : ''}`)
-  // 差分を分けて判定したとき、別々の回から指摘が来たドキュメントは、どの指摘も自分の回の変更しか見ていないので、合わせて直させる
-  const spread = [...byDoc].filter(([, fs]) => new Set(fs.map(f => f.part)).size > 1).map(([doc]) => doc)
+  const lines = [...byDoc.values()].flat().map(f => `- ${f.doc.trim() || '(no document given)'}: ${f.issue}${f.fix ? ` (suggested fix: ${f.fix})` : ''}`)
+  // 差分を分けて判定したとき、別々の回から指摘が来たドキュメントは、どの指摘も自分の回の変更しか見ていないので、合わせて直させる。
+  // 各回はブランチ全体の変更の一覧を見ているので、別々の回が同じずれを指摘することもある。同じ修正を二重に入れないようにも添える
+  const spread = [...byDoc].filter(([doc, fs]) => doc !== '' && new Set(fs.map(f => f.part)).size > 1).map(([doc]) => doc)
   const together =
     spread.length > 0
-      ? ['', `The diff was checked in parts, so some documents have findings from more than one part (${spread.join(', ')}). Each of those findings covers only the changes in its own part: apply all of them together.`]
+      ? [
+          '',
+          `The diff was checked in parts, so some documents have findings from more than one part (${listFiles(spread)}). Each of those findings covers only the changes in its own part: apply all of them together. If two of them point at the same change, make that change once.`,
+        ]
       : []
   // 一部を判定できなかったときも、判定できた部分のずれをまとめて伝える
   const partial =
