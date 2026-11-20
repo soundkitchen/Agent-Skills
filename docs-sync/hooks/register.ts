@@ -937,11 +937,14 @@ async function uiLang($: EngineInterface): Promise<Lang> {
   }
 }
 
-// language 設定の値から言語を決める。値は自由な文字列なので、日本語を指す書き方("japanese"・"日本語"・"ja" など)だけを日本語とする
+// language 設定の値から言語を決める。値は自由な文字列なので、書き方の揺れを受け付ける。
+// japanese・日本語・nihongo を含む値("Japanese (日本語)"・"日本語で" など)と、
+// 言語コードの ja・jp・jpn で始まり、その後が -・_・. か終わりの値("ja-JP"・"ja_JP.UTF-8" など)を日本語とする
+// ("javanese" のように ja の後に文字が続くものは当てない)
 export function langOf(language: unknown): Lang {
   if (typeof language !== 'string') return 'en'
   const v = language.trim().toLowerCase()
-  return /^(ja|jp|ja[-_]jp|japanese|nihongo|日本語)$/.test(v) ? 'ja' : 'en'
+  return /japanese|日本語|nihongo/.test(v) || /^(ja|jp|jpn)([-_.]|$)/.test(v) ? 'ja' : 'en'
 }
 
 // コマンドが gh pr create を実行するなら、その内容を返す。引用符やヒアドキュメントの中の文字列には反応しない

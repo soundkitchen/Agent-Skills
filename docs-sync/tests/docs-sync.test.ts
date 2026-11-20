@@ -1256,10 +1256,16 @@ describe('abortReason', () => {
 
 describe('langOf', () => {
   test('reads the ways to write Japanese as Japanese, whatever the case and the spaces around it', () => {
-    for (const v of ['japanese', 'Japanese', ' JAPANESE ', '日本語', 'ja', 'JA', 'jp', 'ja-JP', 'ja_jp', 'nihongo']) expect(langOf(v)).toBe('ja')
+    for (const v of ['japanese', 'Japanese', ' JAPANESE ', '日本語', 'ja', 'JA', 'jp', 'jpn', 'ja-JP', 'ja_jp', 'ja_JP.UTF-8', 'nihongo']) {
+      expect(langOf(v)).toBe('ja')
+    }
+  })
+
+  test('reads values that contain a way to write Japanese as Japanese', () => {
+    for (const v of ['Japanese (日本語)', '日本語で', 'Japanese, please', 'in nihongo']) expect(langOf(v)).toBe('ja')
   })
 
   test('reads other languages, an empty value and a missing one as English', () => {
-    for (const v of ['english', 'en', 'french', 'japanese and english', '', undefined, null, 1]) expect(langOf(v)).toBe('en')
+    for (const v of ['english', 'en', 'french', 'javanese', 'jamaican', 'jpx', '', undefined, null, 1]) expect(langOf(v)).toBe('en')
   })
 })
