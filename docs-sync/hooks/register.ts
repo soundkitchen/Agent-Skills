@@ -1,8 +1,11 @@
-import type { EngineInterface, Register, ToolCallResult } from 'claude-code'
+import type { EngineInterface, ModelCompleteResult, Register, ToolCallResult } from 'claude-code'
 
-// 判定の上限。モデルは作業中のセッションと同じものを使う
-const MAX_TOKENS = 4096
-const JUDGE_TIMEOUT_MS = 5 * 60 * 1000
+// 判定の上限。モデルは作業中のセッションと同じものを使う。
+// thinking のトークンも上限に数えられ、effort の既定が高いモデル(Fable 5.2 は high)は大きな差分で多く考えるので、
+// 上限が小さいと本文が出る前に止まる(empty-reply)。effort はモデルの既定のままにして、上限で余地を取る
+const MAX_TOKENS = 32000
+// 返答はまとめて返るので、上限を使い切るほど考えると時間がかかる。provider が 10 分で打ち切るので、それに合わせる
+const JUDGE_TIMEOUT_MS = 10 * 60 * 1000
 // 1 回の判定に渡すテキストの上限(文字数)。超えたら関係するドキュメントを先に選ばせ、差分を分けて判定する
 const PROMPT_BUDGET = 300_000
 // 差分を分けて判定するときの回数の上限。入りきらないファイルは、判定できなかったものとして扱う
@@ -789,7 +792,7 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], room: 
     },
     { signal },
   )
-  if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`, [RETRY])
+  if (!r.isAnswered) throw new CheckFailed(`model call failed (${whyNoReply(r)})`, [RETRY])
 
   const wanted = parseJson(r.text)
   if (!Array.isArray(wanted)) throw new CheckFailed('could not read the model reply', [RETRY])
@@ -809,6 +812,13 @@ async function selectDocs($: EngineInterface, model: string, docs: Doc[], room: 
   return out
 }
 
+// モデルの返答が得られなかった理由。本文のない返答は、上限まで考えて止まったのかが分かるように、出力したトークン数を添える
+function whyNoReply(r: Extract<ModelCompleteResult, { isAnswered: false }>): string {
+  if (r.reason !== 'empty-reply') return r.reason
+  const used = r.usage.output_tokens
+  return used >= MAX_TOKENS ? `empty-reply: the model used all ${MAX_TOKENS} output tokens before writing an answer` : `empty-reply after ${used} output tokens`
+}
+
 // 差分を分けて判定するときの、何回目か(index / count)と、ブランチ全体の変更されたファイルの一覧
 type PartContext = { index: number; count: number; changed: string }
 
@@ -824,7 +834,7 @@ async function judge($: EngineInterface, model: string, docs: Doc[], diff: strin
     },
     { signal },
   )
-  if (!r.isAnswered) throw new CheckFailed(`model call failed (${r.reason})`, [RETRY])
+  if (!r.isAnswered) throw new CheckFailed(`model call failed (${whyNoReply(r)})`, [RETRY])
 
   const v = parseJson(r.text) as { status?: unknown; findings?: unknown } | undefined
   if (v?.status === 'ok') return []

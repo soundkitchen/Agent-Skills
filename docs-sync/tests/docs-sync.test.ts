@@ -10,7 +10,8 @@ const HEAD = 'abc123'
 const FEATURE_HEAD = 'f00d42'
 const SESSION_MODEL = 'claude-opus-5-5'
 
-type Model = (prompt: string) => { text: string } | { reason: 'empty-reply' }
+// outputTokens は、本文のない返答までに出力したトークン数(省略時は 0)
+type Model = (prompt: string) => { text: string } | { reason: 'empty-reply'; outputTokens?: number }
 // PR の head のリポジトリは、owner を省略すると o/r。PR を出した先のリポジトリは o/r
 type Pr = { number: number; state: string; baseRefName: string; headRefName: string; owner?: string }
 // fork の構成。origin が自分の fork(me/r)、upstream が元のリポジトリ(o/r)
@@ -164,7 +165,8 @@ function world(
     calls.model += 1
     calls.models.push(e.model)
     const r = opts.model(e.prompt)
-    const usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
+    const output = 'reason' in r ? (r.outputTokens ?? 0) : 0
+    const usage = { input_tokens: 0, output_tokens: output, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 }
     return 'text' in r
       ? { value: { isAnswered: true, text: r.text, usage } }
       : { value: { isAnswered: false, reason: r.reason, usage } }
@@ -621,8 +623,15 @@ describe('docs-sync on a large diff', () => {
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual([])
     expect(calls.model).toBe(2)
-    expect(r.deny).toContain('a part failed: model call failed (empty-reply)')
+    expect(r.deny).toContain('a part failed: model call failed (empty-reply after 0 output tokens)')
     expect(r.deny).toContain(`Run gh pr create again`)
+  })
+
+  test('says the model used up its output tokens when it stops before writing an answer', async ($, on) => {
+    const calls = world(on, { model: () => ({ reason: 'empty-reply', outputTokens: 32000 }) })
+    const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(calls.ran).toEqual([])
+    expect(r.deny).toContain('model call failed (empty-reply: the model used all 32000 output tokens before writing an answer)')
   })
 
   test('tells Claude to run again, not that the file is too large, when git diff fails for a file', async ($, on) => {
