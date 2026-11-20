@@ -1416,7 +1416,9 @@ Do not report:
 Reply with JSON only, no prose:
 {"status":"ok"}
 or
-{"status":"drift","findings":[{"doc":"<document path, or the path that should be added>","issue":"<what does not match, citing the code>","fix":"<what to change in the document>"}]}`
+{"status":"drift","findings":[{"doc":"<document path, or the path that should be added>","issue":"<what does not match, citing the code>","fix":"<what to change in the document>"}]}
+
+Write "issue" and "fix" in English, whatever language the documents and the code are written in. Quote text from the documents or the code as it is written, without translating it.`
 
 const SELECT_SYSTEM = `You pick which documents might need an update for a code change.
 
