@@ -19,7 +19,25 @@ const DOC_FILE = /\.mdx?$/
 const SKIP_FILE =
   /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|deno\.lock|Cargo\.lock|Gemfile\.lock|poetry\.lock|Pipfile\.lock|uv\.lock|composer\.lock|go\.sum|flake\.lock|Podfile\.lock|Package\.resolved|packages\.lock\.json|mix\.lock|pubspec\.lock)$|\.min\.(js|css)$|\.map$/
 
-const ASK_CANCEL = '中止する'
+// ユーザーに見せる文言の言語。language 設定が日本語なら日本語、それ以外(未設定を含む)は英語
+type Lang = 'ja' | 'en'
+// ユーザーに見せる文言(操作ごとの問いと選択肢は Action の ask・proceed)
+const UI_TEXT = {
+  ja: {
+    cancel: '中止する',
+    progress: (i: number, n: number) => `docs-sync: 差分を分けて確認しています(${i}/${n})`,
+    failed: (reason: string, ask: string) => `docs-sync: 実装とドキュメントの差異を確認できませんでした(${reason})。${ask}`,
+    failedFiles: (reason: string, files: string[], ask: string) =>
+      `docs-sync: 差分が大きく、一部のファイルで実装とドキュメントの差異を確認できませんでした(${reason})。確認できなかったファイル: ${listFiles(files, n => ` ほか ${n} 件`)}。${ask}`,
+  },
+  en: {
+    cancel: 'Cancel',
+    progress: (i: number, n: number) => `docs-sync: checking the diff in parts (${i}/${n})`,
+    failed: (reason: string, ask: string) => `docs-sync: could not check the documentation against the implementation (${reason}). ${ask}`,
+    failedFiles: (reason: string, files: string[], ask: string) =>
+      `docs-sync: the diff is large, and some files could not be checked against the documentation (${reason}). Files not checked: ${listFiles(files)}. ${ask}`,
+  },
+} satisfies Record<Lang, unknown>
 
 // part は、差分を分けて判定したときに、その指摘が出た回(1 から)。1 回で判定したときはない
 type Finding = { doc: string; issue: string; fix: string; part?: number }
@@ -40,21 +58,21 @@ export type Push = { cds: string[]; remote?: string; refs: PushRef[]; mover?: st
 // push する refspec。src は push するコミット、dst は push 先のブランチ(省略時は src と同じ)
 export type PushRef = { src: string; dst?: string }
 
-// 割り込む操作ごとの言い回し。command・blocked・retry は Claude に、ask・proceed はユーザーに見せる
-type Action = { command: string; blocked: string; retry: string; ask: string; proceed: string }
+// 割り込む操作ごとの言い回し。command・blocked・retry は Claude に、ask・proceed はユーザーに(言語ごとに)見せる
+type Action = { command: string; blocked: string; retry: string; ask: Record<Lang, string>; proceed: Record<Lang, string> }
 const PR_CREATE: Action = {
   command: 'gh pr create',
   blocked: 'PR creation was blocked',
   retry: 'Commit the fixes, push them, and run gh pr create again.',
-  ask: 'このまま PR を作成しますか?',
-  proceed: 'このまま PR を作成する',
+  ask: { ja: 'このまま PR を作成しますか?', en: 'Create the PR anyway?' },
+  proceed: { ja: 'このまま PR を作成する', en: 'Create the PR anyway' },
 }
 const PUSH: Action = {
   command: 'git push',
   blocked: 'the push was blocked',
   retry: 'Commit the fixes and push again. The push sends them together with the commits it was going to send.',
-  ask: 'このまま push しますか?',
-  proceed: 'このまま push する',
+  ask: { ja: 'このまま push しますか?', en: 'Push anyway?' },
+  proceed: { ja: 'このまま push する', en: 'Push anyway' },
 }
 
 // 止めたときに Claude へ示す、次に取れる手段
@@ -317,9 +335,10 @@ async function compare($: EngineInterface, root: string, base: string, head: str
   // ずれが見つかっても、残りの部分も最後まで判定して、まとめて伝える
   const findings: Finding[] = []
   const failures: string[] = []
+  const text = judged.length > 1 ? UI_TEXT[await uiLang($)] : undefined
   try {
     for (const [i, part] of judged.entries()) {
-      if (judged.length > 1) showStatus($, `docs-sync: 差分を分けて確認しています(${i + 1}/${judged.length})`)
+      if (text !== undefined) showStatus($, text.progress(i + 1, judged.length))
       // 1 回で済むなら、分けていることは伝えない(ほかのファイルについての指摘を控えさせないため)
       const context = judged.length > 1 ? { index: i + 1, count: judged.length, changed } : undefined
       try {
@@ -896,16 +915,36 @@ async function judge($: EngineInterface, model: string, docs: Doc[], diff: strin
 // 判定できなかったとき、続けるかをユーザーに聞く。答えられない(-p 実行・閉じた)ときは中止。
 // 差分の一部だけを判定できなかったときは、そのファイルを示す
 async function confirmAfterFailure($: EngineInterface, action: Action, failed: CheckFailed): Promise<boolean> {
+  const lang = await uiLang($)
+  const text = UI_TEXT[lang]
+  // 理由(failed.message)は Claude にも渡す文なので、英語のまま埋め込む
   const question =
-    failed.files.length > 0
-      ? `docs-sync: 差分が大きく、一部のファイルで実装とドキュメントの差異を確認できませんでした(${failed.message})。確認できなかったファイル: ${listFiles(failed.files, n => ` ほか ${n} 件`)}。${action.ask}`
-      : `docs-sync: 実装とドキュメントの差異を確認できませんでした(${failed.message})。${action.ask}`
+    failed.files.length > 0 ? text.failedFiles(failed.message, failed.files, action.ask[lang]) : text.failed(failed.message, action.ask[lang])
   try {
-    const answer = await $.ui.ask(question, { header: 'docs-sync', options: [action.proceed, ASK_CANCEL] })
-    return answer === action.proceed
+    const answer = await $.ui.ask(question, { header: 'docs-sync', options: [action.proceed[lang], text.cancel] })
+    return answer === action.proceed[lang]
   } catch {
     return false
   }
+}
+
+// ユーザーに見せる文言の言語を、language 設定から決める。読めなければ英語にする
+async function uiLang($: EngineInterface): Promise<Lang> {
+  try {
+    return langOf((await $.settings.read()).language)
+  } catch {
+    return 'en'
+  }
+}
+
+// language 設定の値から言語を決める。値は自由な文字列なので、書き方の揺れを受け付ける。
+// japanese・日本語・nihongo を含む値("Japanese (日本語)"・"日本語で" など)と、
+// 言語コードの ja・jp・jpn で始まり、その後が -・_・. か終わりの値("ja-JP"・"ja_JP.UTF-8" など)を日本語とする
+// ("javanese" のように ja の後に文字が続くものは当てない)
+export function langOf(language: unknown): Lang {
+  if (typeof language !== 'string') return 'en'
+  const v = language.trim().toLowerCase()
+  return /japanese|日本語|nihongo/.test(v) || /^(ja|jp|jpn)([-_.]|$)/.test(v) ? 'ja' : 'en'
 }
 
 // コマンドが gh pr create を実行するなら、その内容を返す。引用符やヒアドキュメントの中の文字列には反応しない
