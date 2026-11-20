@@ -810,7 +810,8 @@ type Reply = { text: string; cap: number; used: number }
 // モデルを呼んで本文を返す。本文が得られなければ、理由を添えて CheckFailed にする
 async function complete($: EngineInterface, model: string, system: string, prompt: string, signal: AbortSignal): Promise<Reply> {
   const call = (cap: number) => $.model.complete({ model, system, prompt, maxTokens: cap, timeoutMs: JUDGE_TIMEOUT_MS }, { signal })
-  const start = Date.now()
+  // 経過時間は $.clock で測る(テストでは時計を差し替えて、時間切れを起こせる)
+  const start = await $.clock.now()
   let cap = MAX_TOKENS
   let r: Awaited<ReturnType<typeof call>>
   try {
@@ -833,11 +834,17 @@ async function complete($: EngineInterface, model: string, system: string, promp
       ? used >= cap
         ? `empty-reply: the model used all ${cap} output tokens before writing an answer`
         : `empty-reply after ${used} output tokens`
-      : // 時間切れも aborted になるので、取り消されていないのに時間を使い切ったものは、時間切れとして伝える
-        r.reason === 'aborted' && !signal.aborted && Date.now() - start >= JUDGE_TIMEOUT_MS
-        ? `timed out after ${JUDGE_TIMEOUT_MS / 60_000} minutes`
+      : r.reason === 'aborted'
+        ? // 取り消されたあとは、時計を読まない(経過時間によらず aborted になる)
+          abortReason(signal.aborted, signal.aborted ? 0 : (await $.clock.now()) - start)
         : r.reason
   throw new CheckFailed(`model call failed (${why})`, [RETRY])
+}
+
+// aborted で終わった呼び出しの理由。時間切れも aborted になるので、取り消されていないのに
+// 時間を使い切ったものは、時間切れとして伝える。cancelled は signal が取り消されたか、elapsed は呼び出しにかかった時間
+export function abortReason(cancelled: boolean, elapsed: number): string {
+  return !cancelled && elapsed >= JUDGE_TIMEOUT_MS ? `timed out after ${JUDGE_TIMEOUT_MS / 60_000} minutes` : 'aborted'
 }
 
 // 返答を読めなかったことを表す。上限まで出力していれば、本文が途中で切れたことを添える
