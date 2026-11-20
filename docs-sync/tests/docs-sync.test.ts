@@ -1,6 +1,6 @@
 import { describe, expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { abortReason, ghRepoFlag, hostOf, joinDir, parseJson, parsePrCreate, parsePush, repoOf, splitCommand } from '../hooks/register.ts'
+import { abortReason, ghRepoFlag, langOf, hostOf, joinDir, parseJson, parsePrCreate, parsePush, repoOf, splitCommand } from '../hooks/register.ts'
 
 // 区切りごとの単語だけを取り出す(置換の中は含めない)
 const wordsOf = (command: string) => splitCommand(command).map(s => s.words)
@@ -65,6 +65,8 @@ function world(
     refusedElapsed?: number
     // true なら時計を差し替えず、$.clock.now() を失敗させる
     clockFails?: boolean
+    // settings の language(省略すると未設定)
+    language?: string
     model: Model
   },
 ) {
@@ -78,6 +80,7 @@ function world(
   on('session.cwd', async () => ({ value: opts.cwd ?? ROOT }))
   on('session.root', async () => ({ value: opts.root ?? opts.cwd ?? ROOT }))
   on('session.model', async () => ({ value: SESSION_MODEL }))
+  on('settings.read', async () => ({ value: opts.language === undefined ? {} : { language: opts.language } }))
 
   on('process.run', async ($, e) => {
     const [cmd, ...args] = e.argv
@@ -476,7 +479,7 @@ describe('docs-sync', () => {
     const calls = world(on, { model: () => ({ text: 'not json' }) })
     on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
       const question = e.questions[0]!.question
-      return { result: { questions: e.questions, answers: { [question]: 'このまま PR を作成する' } } }
+      return { result: { questions: e.questions, answers: { [question]: 'Create the PR anyway' } } }
     })
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual(['gh pr create --fill'])
@@ -488,9 +491,54 @@ describe('docs-sync', () => {
     const calls = world(on, { model: () => ({ text: 'not json' }) })
     on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
       const question = e.questions[0]!.question
-      return { result: { questions: e.questions, answers: { [question]: '中止する' } } }
+      return { result: { questions: e.questions, answers: { [question]: 'Cancel' } } }
     })
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(r.deny).toBeTruthy()
+    expect(calls.ran).toEqual([])
+  })
+
+  test('asks in English when the language setting is not set', async ($, on) => {
+    const asked: { question: string; options: string[] }[] = []
+    const calls = world(on, { model: () => ({ text: 'not json' }) })
+    on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+      const q = e.questions[0]!
+      asked.push({ question: q.question, options: q.options.map(o => o.label) })
+      return { result: { questions: e.questions, answers: { [q.question]: 'Create the PR anyway' } } }
+    })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(asked[0]!.question).toContain('docs-sync: could not check the documentation against the implementation (')
+    expect(asked[0]!.question).toContain('Create the PR anyway?')
+    expect(asked[0]!.options).toEqual(['Create the PR anyway', 'Cancel'])
+    expect(calls.ran).toEqual(['gh pr create --fill'])
+  })
+
+  test('asks in Japanese when the language setting is Japanese', async ($, on) => {
+    const asked: { question: string; options: string[] }[] = []
+    const calls = world(on, { language: 'japanese', model: () => ({ text: 'not json' }) })
+    on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+      const q = e.questions[0]!
+      asked.push({ question: q.question, options: q.options.map(o => o.label) })
+      return { result: { questions: e.questions, answers: { [q.question]: 'このまま PR を作成する' } } }
+    })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(asked[0]!.question).toContain('docs-sync: 実装とドキュメントの差異を確認できませんでした(')
+    expect(asked[0]!.question).toContain('このまま PR を作成しますか?')
+    expect(asked[0]!.options).toEqual(['このまま PR を作成する', '中止する'])
+    expect(calls.ran).toEqual(['gh pr create --fill'])
+  })
+
+  test('asks in English when the language setting is another language', async ($, on) => {
+    const asked: { question: string; options: string[] }[] = []
+    const calls = world(on, { language: 'french', prs: [OPEN_PR], model: () => ({ text: 'not json' }) })
+    on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
+      const q = e.questions[0]!
+      asked.push({ question: q.question, options: q.options.map(o => o.label) })
+      return { result: { questions: e.questions, answers: { [q.question]: 'Cancel' } } }
+    })
+    const r = await $.tool.call({ tool: 'Bash', command: 'git push' })
+    expect(asked[0]!.question).toContain('Push anyway?')
+    expect(asked[0]!.options).toEqual(['Push anyway', 'Cancel'])
     expect(r.deny).toBeTruthy()
     expect(calls.ran).toEqual([])
   })
@@ -593,7 +641,7 @@ describe('docs-sync on a large diff', () => {
     on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
       const question = e.questions[0]!.question
       questions.push(question)
-      return { result: { questions: e.questions, answers: { [question]: 'このまま PR を作成する' } } }
+      return { result: { questions: e.questions, answers: { [question]: 'Create the PR anyway' } } }
     })
     const r = await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     expect(calls.ran).toEqual(['gh pr create --fill'])
@@ -678,6 +726,28 @@ describe('docs-sync on a large diff', () => {
     expect(calls.ran).toEqual([])
     expect(r.deny).toContain('says --fast but the CLI now takes --quick')
     expect(r.deny).toContain('these changed files were not checked: src/huge.ts')
+  })
+
+  test('shows the progress of the parts in the language of the setting, and clears it at the end', async ($, on) => {
+    const shown: (string | undefined)[] = []
+    world(on, { language: 'japanese', files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/c.ts': big('c') }, model: OK })
+    on('ui.status', async ($, e) => {
+      shown.push(e.text)
+      return { value: undefined }
+    })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(shown).toEqual(['docs-sync: 差分を分けて確認しています(1/2)', 'docs-sync: 差分を分けて確認しています(2/2)', undefined])
+  })
+
+  test('shows the progress of the parts in English when the language setting is not set', async ($, on) => {
+    const shown: (string | undefined)[] = []
+    world(on, { files: { 'src/a.ts': big('a'), 'src/b.ts': big('b'), 'src/c.ts': big('c') }, model: OK })
+    on('ui.status', async ($, e) => {
+      shown.push(e.text)
+      return { value: undefined }
+    })
+    await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
+    expect(shown).toEqual(['docs-sync: checking the diff in parts (1/2)', 'docs-sync: checking the diff in parts (2/2)', undefined])
   })
 
   test('checks the other parts when one part fails', async ($, on) => {
@@ -795,7 +865,7 @@ describe('docs-sync on a large diff', () => {
     on('tool.call', { tool: 'AskUserQuestion' }, async ($, e) => {
       const question = e.questions[0]!.question
       questions.push(question)
-      return { result: { questions: e.questions, answers: { [question]: 'このまま PR を作成する' } } }
+      return { result: { questions: e.questions, answers: { [question]: 'Create the PR anyway' } } }
     })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
     await $.tool.call({ tool: 'Bash', command: 'gh pr create --fill' })
@@ -1181,5 +1251,15 @@ describe('abortReason', () => {
 
   test('says aborted when the time the call took is not known', () => {
     expect(abortReason(false, undefined)).toBe('aborted')
+  })
+})
+
+describe('langOf', () => {
+  test('reads the ways to write Japanese as Japanese, whatever the case and the spaces around it', () => {
+    for (const v of ['japanese', 'Japanese', ' JAPANESE ', '日本語', 'ja', 'JA', 'jp', 'ja-JP', 'ja_jp', 'nihongo']) expect(langOf(v)).toBe('ja')
+  })
+
+  test('reads other languages, an empty value and a missing one as English', () => {
+    for (const v of ['english', 'en', 'french', 'japanese and english', '', undefined, null, 1]) expect(langOf(v)).toBe('en')
   })
 })
